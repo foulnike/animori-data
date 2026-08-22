@@ -13,10 +13,6 @@ on:
         description: Пауза между запросами, мс
         required: false
         default: '700'
-      limit:
-        description: Сколько номеров взять (0 — все)
-        required: false
-        default: '0'
       publish:
         description: Публиковать выпуск
         required: false
@@ -39,14 +35,13 @@ jobs:
       - name: Сборка
         env:
           BUILD_PAUSE: ${{ inputs.pause }}
-          BUILD_LIMIT: ${{ inputs.limit }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           node -v
           node scripts/build-names.mjs
 
-      # Артефакт нужен и при пробной сборке без публикации: посмотреть
-      # файлы можно, ничего никому не выпуская.
+      # Артефакт нужен и без публикации: посмотреть на файлы можно,
+      # ничего никому не выпуская.
       - name: Файлы наружу
         if: always()
         uses: actions/upload-artifact@v4
