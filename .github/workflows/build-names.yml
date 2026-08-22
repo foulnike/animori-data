@@ -1,0 +1,71 @@
+# Сборка датасета русских названий. Пока только руками.
+#
+# Расписание появится отдельным шагом и вместе с личным токеном: задача
+# по расписанию отключается после 60 дней без активности человека,
+# а коммиты встроенного токена активностью не считаются.
+
+name: build-names
+
+on:
+  workflow_dispatch:
+    inputs:
+      pause:
+        description: Пауза между запросами, мс
+        required: false
+        default: '700'
+      limit:
+        description: Сколько номеров взять (0 — все)
+        required: false
+        default: '0'
+      publish:
+        description: Публиковать выпуск
+        required: false
+        type: boolean
+        default: true
+
+# Выпуск создаётся встроенным токеном, значит нужна запись в содержимое.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Исходный код
+        uses: actions/checkout@v4
+
+      - name: Сборка
+        env:
+          BUILD_PAUSE: ${{ inputs.pause }}
+          BUILD_LIMIT: ${{ inputs.limit }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node -v
+          node scripts/build-names.mjs
+
+      # Артефакт нужен и при пробной сборке без публикации: посмотреть
+      # файлы можно, ничего никому не выпуская.
+      - name: Файлы наружу
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset
+          path: |
+            index.json
+            titles-anime.json.gz
+            map-mal-anilist.json.gz
+          if-no-files-found: warn
+
+      - name: Выпуск
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(date -u +%Y.%m.%d-%H%M)"
+          gh release create "$tag" \
+            --title "Названия $tag" \
+            --notes-file release-notes.md \
+            --latest \
+            index.json titles-anime.json.gz map-mal-anilist.json.gz

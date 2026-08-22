@@ -1,0 +1,7 @@
+# Артефакты сборки: их место в выпуске, а не в дереве.
+/index.json
+/titles-anime.json.gz
+/map-mal-anilist.json.gz
+/release-notes.md
+
+node_modules/
