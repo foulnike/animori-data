@@ -4,6 +4,11 @@
 // пачками по пятьдесят и складывает рядом с собой три файла: имена, карту
 // номеров и опись с отпечатками. Их подбирает шаг выпуска.
 //
+// После обхода идут две волны обогащения, обе необязательные: карта
+// дополняется с AniList, пустые имена добираются с anime365. Волны стоят
+// после порогов приёмки намеренно — сначала мы знаем, что сборка состоялась,
+// и только потом тратим час на то, что улучшает её, но не решает судьбу.
+//
 // Сам не публикует ничего и в репозиторий не пишет: публикация — отдельный
 // шаг workflow, и он не выполнится, если сборка упала. Половина датасета
 // хуже, чем его отсутствие, поэтому пороги приёмки проверяются здесь.
@@ -16,6 +21,10 @@ import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
+
+import { bump, pct, round1, sleep, why } from './common.mjs'
+import { enrichMap } from './enrich-map.mjs'
+import { enrichNames } from './enrich-names.mjs'
 
 /** Потолок Шикимори на один запрос. */
 const BATCH = 50
@@ -45,8 +54,6 @@ const ANI_MARK = 'anilist.co/anime/'
 const CYRILLIC = /[А-Яа-яЁё]/
 
 const PAUSE_MS = Number(process.env.BUILD_PAUSE || 700)
-/** Потолок числа номеров: 0 — весь список. Нужен для пробной сборки. */
-const LIMIT = Number(process.env.BUILD_LIMIT || 0)
 
 const FILE_TITLES = 'titles-anime.json.gz'
 const FILE_MAP = 'map-mal-anilist.json.gz'
@@ -64,24 +71,6 @@ function fail(message) {
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, line, 'utf8')
   }
   process.exit(1)
-}
-
-/**
- * Разбор отказа сети. У Node в message всегда одно и то же «fetch failed»,
- * а нужное лежит в cause: ENOTFOUND — не разобралось имя, ECONNREFUSED
- * и ETIMEDOUT — адрес закрыт, UND_ERR_CONNECT_TIMEOUT — соединение уронили.
- */
-function why(e) {
-  const cause = e.cause || {}
-  return cause.code || cause.message || e.message || String(e)
-}
-
-const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
-const round1 = (n) => Math.round(n * 10) / 10
-const pct = (n) => `${Math.round(n * 1000) / 10}%`
-
-function bump(counter, key) {
-  counter[key] = (counter[key] || 0) + 1
 }
 
 async function github(path) {
@@ -209,8 +198,6 @@ async function crawl(ids) {
     requests: 0,
     asked: 0,
     answered: 0,
-    russian: 0,
-    cyrillic: 0,
     codes: {},
     tookMs: 0,
   }
@@ -263,8 +250,6 @@ async function crawl(ids) {
     for (const item of answer.items) {
       const russian = (item.russian || '').trim()
       stat.answered++
-      if (russian) stat.russian++
-      if (CYRILLIC.test(russian)) stat.cyrillic++
       // Ровно шесть полей: чем меньше в файле, тем быстрее он грузится.
       rows.push({
         id: item.id,
@@ -291,6 +276,23 @@ async function crawl(ids) {
   return { stat, rows }
 }
 
+/**
+ * Пересчёт имён по готовым записям. Считается в конце, а не по ходу обхода:
+ * после волны anime365 счётчики обхода уже устарели, а опись обязана
+ * описывать то, что лежит в файле, а не то, что было в середине сборки.
+ */
+function countNames(rows) {
+  let russian = 0
+  let cyrillic = 0
+
+  for (const row of rows) {
+    if (row.russian !== '') russian++
+    if (CYRILLIC.test(row.russian)) cyrillic++
+  }
+
+  return { russian, cyrillic }
+}
+
 /** Пишет сжатый файл и возвращает строку описи: имя, размер, отпечаток. */
 function pack(name, payload) {
   const body = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 })
@@ -311,19 +313,27 @@ function report(lines) {
   }
 }
 
+/** Строка отчёта о волне: пропущена, свёрнута или отработала целиком. */
+function waveLine(stat, done) {
+  if (stat.skipped) return 'выключена настройкой'
+  const tail = stat.gaveUp ? ', волна свёрнута досрочно' : ''
+  return `${done} за ${round1(stat.tookMs / 60000)} мин${tail}`
+}
+
 async function main() {
-  console.log(`Сборка: пауза ${PAUSE_MS} мс, потолок номеров ${LIMIT || 'без потолка'}`)
+  console.log(`Сборка: пауза ${PAUSE_MS} мс`)
 
   const manami = await loadManami()
-  const { mal, pairs } = collectIds(manami.entries)
+  const ids = collectIds(manami.entries)
   console.log(
-    `Манами: записей ${manami.entries.length}, с номером MAL ${mal.length}, ` +
-      `с парой MAL+AniList ${pairs.length}`,
+    `Манами: записей ${manami.entries.length}, с номером MAL ${ids.mal.length}, ` +
+      `с парой MAL+AniList ${ids.pairs.length}`,
   )
 
-  const ids = LIMIT > 0 ? mal.slice(0, LIMIT) : mal
-  const { stat, rows } = await crawl(ids)
+  const { stat, rows } = await crawl(ids.mal)
 
+  // Пороги проверяются до волн: сначала убеждаемся, что сборка состоялась,
+  // и только потом тратим час на то, что делает её лучше.
   const known = stat.asked ? stat.answered / stat.asked : 0
   if (rows.length < MIN_TITLES) {
     fail(`собрано ${rows.length} названий при пороге ${MIN_TITLES}`)
@@ -332,19 +342,42 @@ async function main() {
     fail(`Шикимори узнал ${pct(known)} номеров при пороге ${pct(MIN_KNOWN)}`)
   }
 
+  const fromShiki = countNames(rows)
+
+  const map = await enrichMap(ids.mal, ids.pairs)
+  const extra = await enrichNames(rows)
+
+  for (const row of rows) {
+    if (row.russian !== '') continue
+    const found = extra.names.get(row.id)
+    if (found) row.russian = found
+  }
+
+  const pairs = map.pairs
+  const total = countNames(rows)
+
   const builtAt = new Date().toISOString()
   const head = { v: 1, tag: manami.tag, builtAt }
 
   const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
   const mapFile = pack(FILE_MAP, { ...head, count: pairs.length, pairs })
 
+  // Версия описи остаётся первой: поля только добавляются, и старый клиент
+  // читает её как прежде. Поле count как было числом записей, так и осталось —
+  // менять смысл имеющегося поля значило бы соврать всем, кто уже его читает.
   const index = {
     version: 1,
     builtAt,
     source: MANAMI,
     sourceTag: manami.tag,
     license: 'ODbL-1.0',
-    names: { source: stat.mirror, count: rows.length, cyrillic: stat.cyrillic },
+    names: {
+      source: stat.mirror,
+      count: rows.length,
+      russian: total.russian,
+      cyrillic: total.cyrillic,
+      known: Math.round(known * 1000) / 1000,
+    },
     files: [titlesFile, mapFile],
   }
   writeFileSync(FILE_INDEX, `${JSON.stringify(index, null, 2)}\n`, 'utf8')
@@ -356,14 +389,15 @@ async function main() {
     [
       'Русские названия аниме для AniMori.',
       '',
-      `Названий: ${rows.length}, из них кириллицей ${stat.cyrillic}.`,
+      `Записей: ${rows.length}, с русским названием: ${total.russian}, ` +
+        `из них кириллицей: ${total.cyrillic}.`,
       `Соответствий MAL — AniList: ${pairs.length}.`,
       `Собрано ${builtAt} через ${stat.mirror}.`,
       '',
       `Номера и связки: manami-project/anime-offline-database, выпуск ${manami.tag},`,
       'по лицензии ODbL-1.0, содержимое — DbCL-1.0.',
       'Этот датасет — производная база и выходит на тех же условиях: ODbL-1.0.',
-      'Русские названия получены из открытого API Шикимори.',
+      'Русские названия получены из открытых API Шикимори и anime365.',
       '',
       'Постоянный адрес описи:',
       'https://github.com/foulnike/animori-data/releases/latest/download/index.json',
@@ -385,11 +419,17 @@ async function main() {
     '| --- | --- |',
     `| Спрошено номеров | ${stat.asked} |`,
     `| Шикимори знает | ${stat.answered} (${pct(known)}) |`,
-    `| Русское имя есть | ${stat.russian} |`,
-    `| Из них кириллицей | ${stat.cyrillic} (${pct(stat.cyrillic / stat.answered)}) |`,
-    `| Соответствия MAL — AniList | ${pairs.length} |`,
-    `| Запросов | ${stat.requests}, ответы: ${codes} |`,
+    `| Русское имя от Шикимори | ${fromShiki.russian} |`,
+    `| Добрано с anime365 | ${extra.stat.added} из ${extra.stat.empty} пустых |`,
+    `| Русское имя всего | ${total.russian} (${pct(total.russian / rows.length)}) |`,
+    `| Из них кириллицей | ${total.cyrillic} |`,
+    `| Пары от манами | ${ids.pairs.length} |`,
+    `| Пары добраны с AniList | ${map.stat.added} |`,
+    `| Пары всего | ${pairs.length} (${pct(pairs.length / rows.length)} от записей) |`,
+    `| Запросов к Шикимори | ${stat.requests}, ответы: ${codes} |`,
     `| Время обхода | ${round1(stat.tookMs / 60000)} мин через ${stat.mirror} |`,
+    `| Волна карты | ${waveLine(map.stat, `${map.stat.added} пар`)} |`,
+    `| Волна имён | ${waveLine(extra.stat, `${extra.stat.added} имён, ${extra.stat.latin} отброшено латиницей`)} |`,
     `| ${FILE_TITLES} | ${titlesMb} МБ |`,
     `| ${FILE_MAP} | ${mapMb} МБ |`,
     '',
