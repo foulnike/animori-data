@@ -17,8 +17,6 @@ import { bump, pct, round1, sleep, why } from './common.mjs'
 
 /** Адреса по порядку: те же, что знает клиент. */
 const MIRRORS = ['anime365.ru', 'smotret-anime.online']
-/** Коды, означающие «источник жив, но сейчас не отдаёт». */
-const BLOCKED = [403, 429, 502, 503, 520, 521, 522, 523, 524]
 /** Из полной записи нужен ровно один кусок: 229 КБ против двух с половиной. */
 const FIELDS = 'titles'
 const TIMEOUT_MS = 10000
@@ -27,7 +25,7 @@ const PAUSE_MS = Number(process.env.NAMES_PAUSE || 700)
 const SWITCH_AFTER = 3
 /** После скольких отказов подряд волна сдаётся целиком. */
 const GIVE_UP_AFTER = 12
-/** Бюджет волны. Раньше кончится он — раньше кончится и волна. */
+/** Бюджет волны в минутах. Раньше кончится он — раньше кончится и волна. */
 const BUDGET_MS = Number(process.env.NAMES_BUDGET || 60) * 60000
 const REPORT_EVERY = 200
 const CYRILLIC = /[А-Яа-яЁё]/
@@ -35,7 +33,8 @@ const UA = 'AniMori/3.0 (+https://github.com/foulnike/animori-data)'
 
 /** Один запрос к зеркалу. Отказ не бросается: волна разбирает его сама. */
 async function ask(domain, malId) {
-  const url = `https://${domain}/api/series?myAnimeListId=${malId}&limit=1&fields=${FIELDS}`
+  const url =
+    'https://' + domain + `/api/series?myAnimeListId=${malId}&limit=1&fields=${FIELDS}`
   const started = Date.now()
 
   try {
@@ -45,7 +44,9 @@ async function ask(domain, malId) {
     })
     const took = Date.now() - started
 
+    // 404 — источник ответил, данных просто нет. Это не отказ адреса.
     if (answer.status === 404) return { status: 404, took, name: '' }
+
     if (answer.status !== 200) {
       const retryAfter = Number(answer.headers.get('retry-after') || 0)
       return { status: answer.status, took, retryAfter }
@@ -53,8 +54,8 @@ async function ask(domain, malId) {
 
     const body = await answer.json()
     const item = Array.isArray(body.data) ? body.data[0] : null
-    const name = item && item.titles && typeof item.titles.ru === 'string' ? item.titles.ru.trim() : ''
-    return { status: 200, took, name }
+    const ru = item && item.titles ? item.titles.ru : null
+    return { status: 200, took, name: typeof ru === 'string' ? ru.trim() : '' }
   } catch (e) {
     return { status: `сеть: ${why(e)}`, took: Date.now() - started }
   }
@@ -91,7 +92,9 @@ export async function enrichNames(rows) {
   const empty = rows.filter((row) => row.russian === '').map((row) => row.id)
   stat.empty = empty.length
 
-  console.log(`Имена: без русского названия ${empty.length}, бюджет ${round1(BUDGET_MS / 60000)} мин`)
+  console.log(
+    `Имена: без русского названия ${empty.length}, бюджет ${round1(BUDGET_MS / 60000)} мин`,
+  )
   if (empty.length === 0) return { names, stat }
 
   let mirrorAt = 0
@@ -100,7 +103,9 @@ export async function enrichNames(rows) {
   for (const malId of empty) {
     if (Date.now() - startedAll > BUDGET_MS) {
       stat.gaveUp = true
-      console.log(`Имена: бюджет времени исчерпан, волна свёрнута на ${stat.asked} из ${empty.length}`)
+      console.log(
+        `Имена: бюджет исчерпан, свёрнуто на ${stat.asked} из ${empty.length}`,
+      )
       break
     }
 
@@ -147,7 +152,9 @@ export async function enrichNames(rows) {
     }
 
     if (stat.asked % REPORT_EVERY === 0) {
-      console.log(`Имена: ${stat.asked} из ${empty.length} (${pct(stat.asked / empty.length)}), нашли ${stat.added}`)
+      console.log(
+        `Имена: ${stat.asked} из ${empty.length} (${pct(stat.asked / empty.length)}), нашли ${stat.added}`,
+      )
     }
 
     await sleep(PAUSE_MS)
