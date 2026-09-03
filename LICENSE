@@ -1,31 +1,20 @@
-Open Database License (ODbL) v1.0
+MIT License
 
-Этот датасет — производная база от anime-offline-database проекта manami
-(https://github.com/manami-project/anime-offline-database), выпущенной
-под Open Database License v1.0.
+Copyright (c) 2026 foulnike
 
-Согласно разделу 4.2 ODbL, к производной базе прилагается либо сам текст
-лицензии, либо его адрес. Полный текст:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-  https://opendatacommons.org/licenses/odbl/1-0/
-  https://www.opendatacommons.org/licenses/odbl/1-0/odbl-10.txt
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Содержимое базы — номера, названия, даты, оценки — это факты, и они
-доступны по Database Contents License v1.0:
-
-  https://opendatacommons.org/licenses/dbcl/1-0/
-
-Что это значит на деле:
-
-  - пользоваться можно как угодно, включая коммерческое использование;
-  - производную базу нужно выпускать на тех же условиях и называть источник
-    вместе с точным недельным тегом выпуска манами;
-  - если производная база используется публично, её нужно сделать доступной:
-    спрятать данные и раздавать только приложение — нарушение, а не обход.
-
-Русские названия получены из открытого API Шикимори. Это тоже факты:
-описания — авторский текст, и в датасет они не входят и не войдут.
-
-Код в этом репозитории (scripts/, .github/) — MIT, как и в основном
-репозитории AniMori. Лицензия на данные на код не распространяется:
-приложение, показывающее названия, производной базой не становится.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR OTHER DEALINGS IN THE SOFTWARE.
