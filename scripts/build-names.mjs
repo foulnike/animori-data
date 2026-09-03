@@ -1,13 +1,31 @@
 // Сборщик датасета русских названий (шаг 4 в docs/DATA-PIPELINE.md приложения).
 //
-// Берёт номера MyAnimeList из последнего выпуска манами, обходит Шикимори
-// пачками по пятьдесят и складывает рядом с собой три файла: имена, карту
-// номеров и опись с отпечатками. Их подбирает шаг выпуска.
+// Перечисляет каталог Шикимори постранично и складывает рядом с собой три
+// файла: имена, карту номеров и опись с отпечатками. Их подбирает шаг выпуска.
 //
 // После обхода идут две волны обогащения, обе необязательные: карта
 // дополняется с AniList, пустые имена добираются с anime365. Волны стоят
 // после порогов приёмки намеренно — сначала мы знаем, что сборка состоялась,
 // и только потом тратим час на то, что улучшает её, но не решает судьбу.
+//
+// ПОЧЕМУ НЕ МАНАМИ. Раньше номера MyAnimeList брались из выпусков
+// manami-project/anime-offline-database. 4 июля 2026 репозиторий переведён
+// в архив: он доступен только для чтения, и новых недельных выпусков не будет.
+// Вход конвейера навсегда замер бы на теге 2026-27, а пороги приёмки этого
+// не заметили бы никогда: при замороженном входе они остаются зелёными вечно.
+// Поэтому универсум номеров собирается сам, перечислением каталога.
+//
+// ЦЕНА ПЕРЕХОДА. Замер сентября 2026: каталог отдаёт 30 471 запись при
+// limit=50, то есть 610 страниц против 612 запросов у прежнего обхода по
+// явным ids. Обход не подорожал. Даром достались status и aired_on у каждой
+// записи — на них считаются счётчики свежести для описи. Подорожала только
+// волна карты: манами отдавала 18 858 пар бесплатно, а теперь про все номера
+// приходится спрашивать AniList.
+//
+// ЛОВУШКА ЦЕНЗУРЫ. Перечисление без censored=false отдаёт урезанный каталог
+// и молча теряет около шести тысяч записей: цензурированный кончается между
+// смещениями 23 000 и 24 990, а полный идёт до 30 471. Прежний обход по явным
+// ids этот фильтр обходил, поэтому параметр и не был нужен. Убирать нельзя.
 //
 // Сам не публикует ничего и в репозиторий не пишет: публикация — отдельный
 // шаг workflow, и он не выполнится, если сборка упала. Половина датасета
@@ -15,42 +33,64 @@
 //
 // Зависимостей нет намеренно: всё нужное есть в Node из коробки.
 
-import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { gunzipSync, gzipSync } from 'node:zlib'
+import { appendFileSync, writeFileSync } from 'node:fs'
+import { gzipSync } from 'node:zlib'
 
 import { bump, pct, round1, sleep, why } from './common.mjs'
 import { enrichMap } from './enrich-map.mjs'
 import { enrichNames } from './enrich-names.mjs'
 
-/** Потолок Шикимори на один запрос. */
+/**
+ * Потолок Шикимори на одну страницу. limit=100 не ошибка, но и не работает:
+ * замер показал, что он молча приводится к пятидесяти. Страница page=306
+ * при limit=100 вернула данные со смещения 15 250, а не 30 500. Значит обход
+ * вдвое не сократить, и 610 страниц — это пол, а не оценка.
+ */
 const BATCH = 50
-/** Адреса по порядку: два знает клиент, третий — запасной ход сборщика. */
-const MIRRORS = ['shikimori.io', 'shikimori.rip', 'shikimori.one']
+/**
+ * Адреса по порядку. Замер сентября 2026: rip не отказал ни разу из четырёх
+ * проб и отдаёт настоящие пути постеров, io отказал один раз из шести,
+ * one — дважды из четырёх. Поэтому rip теперь первый, а one остался
+ * последним запасным ходом, а не первым выбором, как было раньше.
+ */
+const MIRRORS = ['shikimori.rip', 'shikimori.io', 'shikimori.one']
 /** После скольких отказов подряд обход уходит на следующий адрес. */
 const SWITCH_AFTER = 3
 /** Осмысленный User-Agent обязателен: без него Шикимори отвечает отказом. */
 const UA = 'AniMori/3.0 (+https://github.com/foulnike/animori-data)'
 /** Адреса складываются из частей, как зеркала в api/shikimori.ts приложения. */
-const GITHUB_API = 'https://api.github.com'
-const SHIKI_PATH = '/api/animes?ids='
+const SHIKI_PATH = '/api/animes'
 /** Потолок одного запроса: виснувшее соединение не должно съесть весь прогон. */
 const TIMEOUT_MS = 15000
-/** Откуда берутся номера. */
-const MANAMI = 'manami-project/anime-offline-database'
-/** Имя базы в выпуске. Точное: под маску «minified» подходят и списки мёртвых записей. */
-const ASSET = 'anime-offline-database-minified.json'
-/** Пороги приёмки. Ниже — сборка не состоялась и наружу не выходит. */
-const MIN_TITLES = 20000
-const MIN_KNOWN = 0.9
-/** Через сколько запросов печатается строка о ходе дела. */
+/**
+ * Предохранитель от бесконечного перечисления. Замер дал 610 страниц, потолок
+ * page у Шикимори — сто тысяч, а отсечки по смещению нет вовсе: за концом
+ * каталога приходит пустой массив, а не ошибка. Упёрлись в две тысячи страниц
+ * (сто тысяч записей, втрое больше каталога) — сломалось условие остановки,
+ * и сборка обязана упасть, а не крутиться до таймаута прогона.
+ */
+const MAX_PAGES = 2000
+/**
+ * Опись прошлого выпуска: единственная живая база сравнения. Постоянный адрес,
+ * тот же, что читает клиент. Без токена: репозиторий публичный.
+ */
+const LATEST_INDEX =
+  'https://github.com/foulnike/animori-data/releases/latest/download/index.json'
+/** Порог приёмки. Ниже — сборка не состоялась и наружу не выходит. */
+const MIN_TITLES = 25000
+/**
+ * Насколько каталог вправе усохнуть против прошлого выпуска. Записи у Шикимори
+ * изредка пропадают, и процент-два — обычная уборка. Обвал на двадцатую часть
+ * означает не уборку, а поломку: оборванное перечисление, подмену ответа
+ * или потерю censored=false. Прежний порог по доле узнанных номеров такое
+ * не ловил и после перехода на перечисление стал тождественной единицей.
+ */
+const MAX_SHRINK = 0.05
+/** Окно свежести содержимого: записи, начавшие выходить за последние полгода. */
+const FRESH_DAYS = 180
+/** Через сколько страниц печатается строка о ходе дела. */
 const REPORT_EVERY = 50
-/** Метки источников в записи манами. Без регэкспов: строк тут сотня тысяч. */
-const MAL_MARK = 'myanimelist.net/anime/'
-const ANI_MARK = 'anilist.co/anime/'
 const CYRILLIC = /[А-Яа-яЁё]/
 
 const PAUSE_MS = Number(process.env.BUILD_PAUSE || 700)
@@ -73,98 +113,49 @@ function fail(message) {
   process.exit(1)
 }
 
-async function github(path) {
-  const headers = { 'user-agent': UA, accept: 'application/vnd.github+json' }
-  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
-  const answer = await fetch(GITHUB_API + path, { headers })
-  if (!answer.ok) fail(`GitHub ответил ${answer.status} на ${path}`)
-  return answer.json()
-}
-
 /**
- * Файл базы в выпуске манами. По точному имени: под маску подходят соседи
- * вроде anidb-minified.json — списки мёртвых записей на десятки килобайт.
- * Разбор такого файла проходит, массива data в нём нет.
+ * Опись прошлого выпуска. Отказ чтения не роняет сборку: первый прогон
+ * в пустом репозитории базы сравнения не имеет, и это законно. Проверка
+ * усадки тогда просто не делается, а порог по количеству остаётся.
  */
-function pickAsset(assets) {
-  for (const ext of ['', '.zst', '.gz']) {
-    const hit = assets.find((a) => a.name === ASSET + ext)
-    if (hit) return hit
-  }
-  fail(`в выпуске манами нет ${ASSET}, лежит: ${assets.map((a) => a.name).join(', ')}`)
-}
-
-/** Расжатие. zstd гоним через файл: у spawnSync потолок буфера в мегабайт. */
-function decompress(name, body) {
-  if (name.endsWith('.gz')) return gunzipSync(body)
-  if (!name.endsWith('.zst')) return body
-
-  const dir = mkdtempSync(join(tmpdir(), 'manami-'))
-  const packed = join(dir, 'base.zst')
-  const plain = join(dir, 'base.json')
-  writeFileSync(packed, body)
-  const run = spawnSync('zstd', ['-d', '-f', '-o', plain, packed], { stdio: 'inherit' })
-  if (run.status !== 0) fail(`zstd не расжал базу манами (код ${run.status})`)
-  return readFileSync(plain)
-}
-
-/**
- * Последний выпуск манами. Именно выпуск, а не raw из ветки: после тега 2025-25
- * базы живут только в выпусках, а старый адрес однажды тихо притащит пустоту.
- */
-async function loadManami() {
-  const release = await github(`/repos/${MANAMI}/releases/latest`)
-  const asset = pickAsset(release.assets || [])
-  const sizeMb = round1(asset.size / 1048576)
-  console.log(`Манами: выпуск ${release.tag_name}, файл ${asset.name}, ${sizeMb} МБ`)
-
-  const answer = await fetch(asset.browser_download_url, { headers: { 'user-agent': UA } })
-  if (!answer.ok) fail(`файл выпуска манами не скачался: HTTP ${answer.status}`)
-  const raw = decompress(asset.name, Buffer.from(await answer.arrayBuffer()))
-
-  let base = null
+async function loadBaseline() {
   try {
-    base = JSON.parse(raw.toString('utf8'))
-  } catch (e) {
-    fail(`файл выпуска манами не разобрался как JSON: ${e.message}`)
-  }
+    const answer = await fetch(LATEST_INDEX, {
+      headers: { 'user-agent': UA, accept: 'application/json' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
 
-  const entries = base.data
-  if (!Array.isArray(entries)) {
-    fail(`в файле ${asset.name} нет массива data, а есть: ${Object.keys(base).join(', ')}`)
-  }
-  return { tag: release.tag_name, entries }
-}
-
-/** Из записи манами нужны только номера: имена всё равно приедут с Шикимори. */
-function collectIds(entries) {
-  const mal = []
-  const pairs = []
-
-  for (const entry of entries) {
-    let m = 0
-    let a = 0
-    for (const source of entry.sources || []) {
-      if (!m) {
-        const at = source.indexOf(MAL_MARK)
-        if (at >= 0) m = Number(source.slice(at + MAL_MARK.length))
-      }
-      if (!a) {
-        const at = source.indexOf(ANI_MARK)
-        if (at >= 0) a = Number(source.slice(at + ANI_MARK.length))
-      }
+    if (!answer.ok) {
+      console.log(`База сравнения: HTTP ${answer.status}, проверка усадки пропущена`)
+      return null
     }
-    if (!Number.isFinite(m) || m <= 0) continue
-    mal.push(m)
-    if (Number.isFinite(a) && a > 0) pairs.push([m, a])
-  }
 
-  return { mal, pairs }
+    const body = await answer.json()
+    const count = body && body.names ? Number(body.names.count) : 0
+    if (!Number.isFinite(count) || count <= 0) {
+      console.log('База сравнения: в описи нет числа записей, проверка усадки пропущена')
+      return null
+    }
+
+    const maxId = body && body.freshness ? Number(body.freshness.maxId) : 0
+    console.log(`База сравнения: прошлый выпуск ${count} записей`)
+    return { count, maxId: Number.isFinite(maxId) ? maxId : 0 }
+  } catch (e) {
+    console.log(`База сравнения не скачалась (${why(e)}), проверка усадки пропущена`)
+    return null
+  }
 }
 
-/** Одна пачка к зеркалу. Куки не шлём — клиент тоже не шлёт: с ними бывает 400. */
-async function ask(domain, batch) {
-  const url = 'https://' + domain + SHIKI_PATH + batch.join(',') + '&limit=' + BATCH
+/**
+ * Одна страница каталога. Куки не шлём — клиент тоже не шлёт: с ними бывает 400.
+ * order=id даёт устойчивый порядок, censored=false — полный каталог.
+ */
+async function ask(domain, page) {
+  const url =
+    'https://' +
+    domain +
+    SHIKI_PATH +
+    `?page=${page}&limit=${BATCH}&order=id&censored=false`
   const started = Date.now()
 
   try {
@@ -188,39 +179,54 @@ async function ask(domain, batch) {
 }
 
 /**
- * Полный обход. Пачка не бросается при отказе: она повторяется, а после трёх
- * отказов подряд обход уходит на следующий адрес. Прогон, где первое зеркало
- * молчало на каждой пачке, уже был на пробе — сборка обязана это пережить.
+ * Полное перечисление каталога. Страница не бросается при отказе: она
+ * повторяется, а после трёх отказов подряд обход уходит на следующий адрес.
+ * Прогон, где первое зеркало молчало на каждой пачке, уже был на пробе —
+ * сборка обязана это пережить.
+ *
+ * Заодно считаются счётчики свежести. Они берутся из status и aired_on,
+ * которых в файле записей нет и не будет: описи они нужны, а клиенту нет.
  */
-async function crawl(ids) {
+async function crawl() {
   const stat = {
     mirror: MIRRORS[0],
     requests: 0,
-    asked: 0,
-    answered: 0,
+    pages: 0,
     codes: {},
     tookMs: 0,
   }
+  const fresh = { maxId: 0, airedRecent: 0, released: 0, ongoing: 0, anons: 0 }
   const rows = []
+  const seen = new Set()
   const startedAll = Date.now()
 
-  let at = 0
+  // Границы окна свежести строками: обе даты в формате YYYY-MM-DD, и сравнение
+  // строк для них совпадает со сравнением дат.
+  const today = new Date().toISOString().slice(0, 10)
+  const recentFrom = new Date(Date.now() - FRESH_DAYS * 86400000)
+    .toISOString()
+    .slice(0, 10)
+
+  let page = 1
   let mirrorAt = 0
   let misses = 0
 
-  while (at < ids.length) {
+  for (;;) {
+    if (page > MAX_PAGES) {
+      fail(`перечисление не кончилось за ${MAX_PAGES} страниц: условие остановки сломано`)
+    }
+
     const domain = MIRRORS[mirrorAt]
-    const batch = ids.slice(at, at + BATCH)
-    let answer = await ask(domain, batch)
+    let answer = await ask(domain, page)
 
     // Один повтор на 429: лимит говорит «подожди», а не «уходи».
     if (answer.status === 429) {
       const wait = Math.max(answer.retryAfter * 1000, 5000)
-      console.log(`${domain}: 429, ждём ${wait} мс и повторяем ту же пачку`)
+      console.log(`${domain}: 429, ждём ${wait} мс и повторяем ту же страницу`)
       stat.requests++
       bump(stat.codes, 429)
       await sleep(wait)
-      answer = await ask(domain, batch)
+      answer = await ask(domain, page)
     }
 
     stat.requests++
@@ -228,13 +234,13 @@ async function crawl(ids) {
 
     if (answer.status !== 200) {
       misses++
-      console.log(`${domain}: пачка ${1 + at / BATCH} — ${answer.status}`)
+      console.log(`${domain}: страница ${page} — ${answer.status}`)
 
       if (misses >= SWITCH_AFTER) {
         mirrorAt++
         misses = 0
         if (mirrorAt >= MIRRORS.length) {
-          fail(`все адреса Шикимори перестали отвечать на пачке ${1 + at / BATCH}`)
+          fail(`все адреса Шикимори перестали отвечать на странице ${page}`)
         }
         stat.mirror = MIRRORS[mirrorAt]
         console.log(`Уходим на ${stat.mirror}: ${domain} не отвечает`)
@@ -245,14 +251,45 @@ async function crawl(ids) {
     }
 
     misses = 0
-    stat.asked += batch.length
+
+    // Пустая страница — законный конец каталога, а не отказ: отсечки
+    // по смещению у Шикимори нет, за последней страницей приходит [].
+    if (answer.items.length === 0) {
+      console.log(`Каталог кончился: страница ${page} пуста`)
+      break
+    }
+
+    stat.pages++
 
     for (const item of answer.items) {
+      const id = item.id
+      if (!Number.isFinite(id) || id <= 0) continue
+
+      // Страницы могут перекрыться, если каталог пополнился прямо во время
+      // обхода: order=id держит порядок, но новая запись сдвигает хвост.
+      // Повтор отбрасывается по номеру, иначе он попал бы в файл дважды.
+      if (seen.has(id)) continue
+      seen.add(id)
+
       const russian = (item.russian || '').trim()
-      stat.answered++
+
+      if (id > fresh.maxId) fresh.maxId = id
+      if (item.status === 'released') fresh.released++
+      else if (item.status === 'ongoing') fresh.ongoing++
+      else if (item.status === 'anons') fresh.anons++
+
+      // aired_on бывает null и бывает в будущем: у анонсов там дата
+      // следующего года, встречались 2026-10-04 и 2027-01-01. Поэтому окно
+      // закрыто с двух сторон, а анонсы в счёт свежести не идут вовсе.
+      // Из-за них максимум по aired_on негоден как метрика в принципе.
+      const aired = typeof item.aired_on === 'string' ? item.aired_on : ''
+      if (aired >= recentFrom && aired <= today && item.status !== 'anons') {
+        fresh.airedRecent++
+      }
+
       // Ровно шесть полей: чем меньше в файле, тем быстрее он грузится.
       rows.push({
-        id: item.id,
+        id,
         name: item.name,
         russian,
         kind: item.kind,
@@ -261,19 +298,16 @@ async function crawl(ids) {
       })
     }
 
-    at += BATCH
-
-    if (stat.requests % REPORT_EVERY === 0) {
-      const done = Math.min(at, ids.length)
-      const part = pct(done / ids.length)
-      console.log(`Обход: ${done} из ${ids.length} (${part}), имён ${rows.length}`)
+    if (stat.pages % REPORT_EVERY === 0) {
+      console.log(`Обход: страница ${page}, записей ${rows.length}`)
     }
 
+    page++
     await sleep(PAUSE_MS)
   }
 
   stat.tookMs = Date.now() - startedAll
-  return { stat, rows }
+  return { stat, rows, fresh }
 }
 
 /**
@@ -321,30 +355,39 @@ function waveLine(stat, done) {
 }
 
 async function main() {
-  console.log(`Сборка: пауза ${PAUSE_MS} мс`)
+  console.log(`Сборка: пауза ${PAUSE_MS} мс, перечисление каталога Шикимори`)
 
-  const manami = await loadManami()
-  const ids = collectIds(manami.entries)
-  console.log(
-    `Манами: записей ${manami.entries.length}, с номером MAL ${ids.mal.length}, ` +
-      `с парой MAL+AniList ${ids.pairs.length}`,
-  )
-
-  const { stat, rows } = await crawl(ids.mal)
+  const baseline = await loadBaseline()
+  const { stat, rows, fresh } = await crawl()
 
   // Пороги проверяются до волн: сначала убеждаемся, что сборка состоялась,
   // и только потом тратим час на то, что делает её лучше.
-  const known = stat.asked ? stat.answered / stat.asked : 0
   if (rows.length < MIN_TITLES) {
     fail(`собрано ${rows.length} названий при пороге ${MIN_TITLES}`)
   }
-  if (known < MIN_KNOWN) {
-    fail(`Шикимори узнал ${pct(known)} номеров при пороге ${pct(MIN_KNOWN)}`)
+
+  if (baseline !== null) {
+    const floor = Math.floor(baseline.count * (1 - MAX_SHRINK))
+    if (rows.length < floor) {
+      fail(
+        `каталог усох: ${rows.length} записей против ${baseline.count} ` +
+          `в прошлом выпуске, порог ${floor}`,
+      )
+    }
+    if (fresh.maxId < baseline.maxId) {
+      fail(
+        `голова каталога уехала назад: ${fresh.maxId} против ${baseline.maxId} ` +
+          'в прошлом выпуске',
+      )
+    }
   }
 
   const fromShiki = countNames(rows)
+  const malIds = rows.map((row) => row.id)
 
-  const map = await enrichMap(ids.mal, ids.pairs)
+  // Готовых пар больше нет: манами отдавала 18 858 бесплатно, теперь волна
+  // спрашивает AniList про все номера. Пустой список означает ровно это.
+  const map = await enrichMap(malIds, [])
   const extra = await enrichNames(rows)
 
   for (const row of rows) {
@@ -357,7 +400,10 @@ async function main() {
   const total = countNames(rows)
 
   const builtAt = new Date().toISOString()
-  const head = { v: 1, tag: manami.tag, builtAt }
+  // Тег теперь свой, а не недельный тег манами: он называет голову каталога,
+  // которую видела эта сборка. По движению тега видно, что вход живой.
+  const sourceTag = `id-${fresh.maxId}`
+  const head = { v: 1, tag: sourceTag, builtAt }
 
   const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
   const mapFile = pack(FILE_MAP, { ...head, count: pairs.length, pairs })
@@ -365,25 +411,44 @@ async function main() {
   // Версия описи остаётся первой: поля только добавляются, и старый клиент
   // читает её как прежде. Поле count как было числом записей, так и осталось —
   // менять смысл имеющегося поля значило бы соврать всем, кто уже его читает.
+  //
+  // names.known остаётся ради совместимости, но смысла в нём больше нет:
+  // при перечислении мы получаем ровно то, что каталог отдал, и доля узнанных
+  // номеров тождественно равна единице. Живую проверку делает сравнение
+  // с прошлым выпуском выше, а не этот порог.
   const index = {
     version: 1,
     builtAt,
-    source: MANAMI,
-    sourceTag: manami.tag,
+    source: 'shikimori',
+    sourceTag,
     license: 'ODbL-1.0',
     names: {
       source: stat.mirror,
       count: rows.length,
       russian: total.russian,
       cyrillic: total.cyrillic,
-      known: Math.round(known * 1000) / 1000,
+      known: 1,
+    },
+    // Свежесть содержимого, а не файла. Возраст выпуска сторож видит и без нас,
+    // а вот застывший вход виден только отсюда: голова каталога и число
+    // записей, начавших выходить за последние FRESH_DAYS дней. Сторож сравнивает
+    // maxId с текущей головой Шикимори и ловит застой, при котором выпуски
+    // выходят исправно, а содержимое в них не меняется.
+    freshness: {
+      maxId: fresh.maxId,
+      freshDays: FRESH_DAYS,
+      airedRecent: fresh.airedRecent,
+      released: fresh.released,
+      ongoing: fresh.ongoing,
+      anons: fresh.anons,
     },
     files: [titlesFile, mapFile],
   }
   writeFileSync(FILE_INDEX, `${JSON.stringify(index, null, 2)}\n`, 'utf8')
 
-  // Уведомление в описании выпуска — это атрибуция по разделу 4.2 ODbL,
-  // а не украшение: выпуск обязан называть источник и его недельный тег.
+  // Источник и лицензия называются в описании выпуска намеренно: датасет
+  // производный, и условия распространения обязаны быть видны без похода
+  // в репозиторий. Атрибуция манами убрана вместе с самим манами.
   writeFileSync(
     FILE_NOTES,
     [
@@ -393,11 +458,13 @@ async function main() {
         `из них кириллицей: ${total.cyrillic}.`,
       `Соответствий MAL — AniList: ${pairs.length}.`,
       `Собрано ${builtAt} через ${stat.mirror}.`,
+      `Голова каталога — номер ${fresh.maxId}, за последние ${FRESH_DAYS} дней ` +
+        `начали выходить ${fresh.airedRecent} записей.`,
       '',
-      `Номера и связки: manami-project/anime-offline-database, выпуск ${manami.tag},`,
-      'по лицензии ODbL-1.0, содержимое — DbCL-1.0.',
-      'Этот датасет — производная база и выходит на тех же условиях: ODbL-1.0.',
-      'Русские названия получены из открытых API Шикимори и anime365.',
+      'Номера и русские названия получены перечислением открытого API Шикимори',
+      'с параметром censored=false. Пары MAL — AniList дополнены с AniList,',
+      'пустые названия добраны с anime365.',
+      'Этот датасет — производная база и выходит на условиях ODbL-1.0.',
       '',
       'Постоянный адрес описи:',
       'https://github.com/foulnike/animori-data/releases/latest/download/index.json',
@@ -411,21 +478,26 @@ async function main() {
   const codes = Object.entries(stat.codes)
     .map(([code, count]) => `${code} × ${count}`)
     .join(', ')
+  const baseLine =
+    baseline === null ? 'нет базы сравнения' : `${baseline.count} записей`
 
   report([
-    `## Сборка датасета: ${manami.tag}`,
+    `## Сборка датасета: ${sourceTag}`,
     '',
     '| Что | Сколько |',
     '| --- | --- |',
-    `| Спрошено номеров | ${stat.asked} |`,
-    `| Шикимори знает | ${stat.answered} (${pct(known)}) |`,
+    `| Страниц каталога | ${stat.pages} |`,
+    `| Записей собрано | ${rows.length} |`,
+    `| Голова каталога | ${fresh.maxId} |`,
+    `| Прошлый выпуск | ${baseLine} |`,
     `| Русское имя от Шикимори | ${fromShiki.russian} |`,
     `| Добрано с anime365 | ${extra.stat.added} из ${extra.stat.empty} пустых |`,
     `| Русское имя всего | ${total.russian} (${pct(total.russian / rows.length)}) |`,
     `| Из них кириллицей | ${total.cyrillic} |`,
-    `| Пары от манами | ${ids.pairs.length} |`,
     `| Пары добраны с AniList | ${map.stat.added} |`,
     `| Пары всего | ${pairs.length} (${pct(pairs.length / rows.length)} от записей) |`,
+    `| Вышло за ${FRESH_DAYS} дн. | ${fresh.airedRecent} |`,
+    `| Состояния | released ${fresh.released}, ongoing ${fresh.ongoing}, anons ${fresh.anons} |`,
     `| Запросов к Шикимори | ${stat.requests}, ответы: ${codes} |`,
     `| Время обхода | ${round1(stat.tookMs / 60000)} мин через ${stat.mirror} |`,
     `| Волна карты | ${waveLine(map.stat, `${map.stat.added} пар`)} |`,
