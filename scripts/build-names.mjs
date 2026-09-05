@@ -8,6 +8,16 @@
 // после порогов приёмки намеренно — сначала мы знаем, что сборка состоялась,
 // и только потом тратим час на то, что улучшает её, но не решает судьбу.
 //
+// СЕМЯ КАРТЫ. Волна карты получает пары прошлого выпуска и спрашивает AniList
+// только про новые номера. Следствий два. Обычная неделя стоит десятки
+// запросов вместо шестисот десяти. И, что важнее, неделя, в которую AniList
+// не отвечает вовсе, отдаёт в выпуск карту прошлой недели, а не пустой файл:
+// до семени волна в такой неделе сворачивалась по пяти отказам, карта уходила
+// пустой, и пороги приёмки этого не замечали — они стоят до волн.
+// Плата за семя — карта умеет застывать незаметно, ровно как застыл бы вход
+// на манами. Поэтому её возраст назван в описи, в самом файле карты
+// и в описании выпуска, а порог приёмки у карты теперь свой.
+//
 // ПОЧЕМУ НЕ МАНАМИ. Раньше номера MyAnimeList брались из выпусков
 // manami-project/anime-offline-database. 4 июля 2026 репозиторий переведён
 // в архив: он доступен только для чтения, и новых недельных выпусков не будет.
@@ -18,9 +28,10 @@
 // ЦЕНА ПЕРЕХОДА. Замер сентября 2026: каталог отдаёт 30 471 запись при
 // limit=50, то есть 610 страниц против 612 запросов у прежнего обхода по
 // явным ids. Обход не подорожал. Даром достались status и aired_on у каждой
-// записи — на них считаются счётчики свежести для описи. Подорожала только
-// волна карты: манами отдавала 18 858 пар бесплатно, а теперь про все номера
-// приходится спрашивать AniList.
+// записи — на них считаются счётчики свежести для описи. Волна карты дорожала
+// лишь однажды: пока семени не было, она спрашивала про все тридцать тысяч
+// номеров. С семенем прошлого выпуска цена вернулась к прежней, и чужой
+// архив для этого не понадобился.
 //
 // ЛОВУШКА ЦЕНЗУРЫ. Перечисление без censored=false отдаёт урезанный каталог
 // и молча теряет около шести тысяч записей: цензурированный кончается между
@@ -35,7 +46,7 @@
 
 import { createHash } from 'node:crypto'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { gzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync } from 'node:zlib'
 
 import { bump, pct, round1, sleep, why } from './common.mjs'
 import { enrichMap } from './enrich-map.mjs'
@@ -53,6 +64,11 @@ const BATCH = 50
  * проб и отдаёт настоящие пути постеров, io отказал один раз из шести,
  * one — дважды из четырёх. Поэтому rip теперь первый, а one остался
  * последним запасным ходом, а не первым выбором, как было раньше.
+ *
+ * Замер сделан с раннеров GitHub, то есть из-за границы. У клиента свой
+ * порядок в SHIKI_DOMAINS и свои причины: там адрес российский, и смысл .rip
+ * именно в обходе блокировки. Переносить этот порядок в клиент без замера
+ * с клиентской стороны нельзя.
  */
 const MIRRORS = ['shikimori.rip', 'shikimori.io', 'shikimori.one']
 /** После скольких отказов подряд обход уходит на следующий адрес. */
@@ -72,11 +88,11 @@ const TIMEOUT_MS = 15000
  */
 const MAX_PAGES = 2000
 /**
- * Опись прошлого выпуска: единственная живая база сравнения. Постоянный адрес,
- * тот же, что читает клиент. Без токена: репозиторий публичный.
+ * Файлы прошлого выпуска: база сравнения для порогов и семя для волны карты.
+ * Постоянный адрес, тот же, что читает клиент. Без токена: это раздача
+ * выпусков, а не API GitHub, и лимита анонимных запросов здесь нет.
  */
-const LATEST_INDEX =
-  'https://github.com/foulnike/animori-data/releases/latest/download/index.json'
+const RELEASE_BASE = 'https://github.com/foulnike/animori-data/releases/latest/download'
 /** Порог приёмки. Ниже — сборка не состоялась и наружу не выходит. */
 const MIN_TITLES = 25000
 /**
@@ -85,6 +101,9 @@ const MIN_TITLES = 25000
  * означает не уборку, а поломку: оборванное перечисление, подмену ответа
  * или потерю censored=false. Прежний порог по доле узнанных номеров такое
  * не ловил и после перехода на перечисление стал тождественной единицей.
+ *
+ * Тем же порогом проверяется карта: с семенем она вообще не вправе стать
+ * меньше прошлого выпуска, и просадка означает потерю семени, а не уборку.
  */
 const MAX_SHRINK = 0.05
 /** Окно свежести содержимого: записи, начавшие выходить за последние полгода. */
@@ -117,10 +136,12 @@ function fail(message) {
  * Опись прошлого выпуска. Отказ чтения не роняет сборку: первый прогон
  * в пустом репозитории базы сравнения не имеет, и это законно. Проверка
  * усадки тогда просто не делается, а порог по количеству остаётся.
+ *
+ * Отсюда же берётся строка о карте: по ней качается и сверяется семя.
  */
 async function loadBaseline() {
   try {
-    const answer = await fetch(LATEST_INDEX, {
+    const answer = await fetch(`${RELEASE_BASE}/${FILE_INDEX}`, {
       headers: { 'user-agent': UA, accept: 'application/json' },
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
@@ -138,10 +159,86 @@ async function loadBaseline() {
     }
 
     const maxId = body && body.freshness ? Number(body.freshness.maxId) : 0
+    // Строка о карте нужна целиком: в ней и имя файла, и отпечаток для сверки.
+    const files = body && Array.isArray(body.files) ? body.files : []
+    const mapFile = files.find((file) => file && file.name === FILE_MAP) || null
+
     console.log(`База сравнения: прошлый выпуск ${count} записей`)
-    return { count, maxId: Number.isFinite(maxId) ? maxId : 0 }
+    return {
+      count,
+      maxId: Number.isFinite(maxId) ? maxId : 0,
+      tag: typeof body.sourceTag === 'string' ? body.sourceTag : '',
+      builtAt: typeof body.builtAt === 'string' ? body.builtAt : '',
+      mapFile,
+    }
   } catch (e) {
     console.log(`База сравнения не скачалась (${why(e)}), проверка усадки пропущена`)
+    return null
+  }
+}
+
+/**
+ * Карта прошлого выпуска — семя волны. Отказ не роняет сборку: без семени
+ * волна спросит AniList про все номера, как делала до его появления.
+ *
+ * Отпечаток сверяется до распаковки, как это делает клиент в api/dataset.ts:
+ * половина архива, разобранная в пары, хуже отсутствия семени. Пары приходят
+ * из своего же выпуска, но проверяются как чужие: порченая пара тихо увела бы
+ * клиента на чужой тайтл, и найти такое потом почти нельзя.
+ */
+async function loadSeed(mapFile) {
+  if (mapFile === null) {
+    console.log('Семя карты: в описи прошлого выпуска нет строки о карте')
+    return null
+  }
+
+  try {
+    const answer = await fetch(`${RELEASE_BASE}/${mapFile.name}`, {
+      headers: { 'user-agent': UA },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+
+    if (!answer.ok) {
+      console.log(`Семя карты: HTTP ${answer.status}, волна спросит про все номера`)
+      return null
+    }
+
+    const packed = Buffer.from(await answer.arrayBuffer())
+    const digest = createHash('sha256').update(packed).digest('hex')
+    const stamp = typeof mapFile.sha256 === 'string' ? mapFile.sha256 : ''
+    if (stamp !== '' && digest !== stamp) {
+      console.log('Семя карты: отпечаток не сошёлся с описью, семя отброшено')
+      return null
+    }
+
+    const body = JSON.parse(gunzipSync(packed).toString('utf8'))
+    const raw = body && Array.isArray(body.pairs) ? body.pairs : null
+    if (raw === null) {
+      console.log('Семя карты: в файле нет списка пар, семя отброшено')
+      return null
+    }
+
+    const pairs = []
+    for (const pair of raw) {
+      if (!Array.isArray(pair) || pair.length !== 2) continue
+      const [mal, anilist] = pair
+      if (!Number.isInteger(mal) || !Number.isInteger(anilist)) continue
+      if (mal <= 0 || anilist <= 0) continue
+      pairs.push([mal, anilist])
+    }
+
+    const dropped = raw.length - pairs.length
+    const tag = typeof body.tag === 'string' && body.tag !== '' ? body.tag : 'без тега'
+    const tail = dropped > 0 ? `, отброшено порченых ${dropped}` : ''
+    console.log(`Семя карты: ${pairs.length} пар от ${tag}${tail}`)
+
+    return {
+      pairs,
+      tag: typeof body.tag === 'string' ? body.tag : '',
+      builtAt: typeof body.builtAt === 'string' ? body.builtAt : '',
+    }
+  } catch (e) {
+    console.log(`Семя карты не скачалось (${why(e)}), волна спросит про все номера`)
     return null
   }
 }
@@ -311,212 +408,4 @@ async function crawl() {
 }
 
 /**
- * Пересчёт имён по готовым записям. Считается в конце, а не по ходу обхода:
- * после волны anime365 счётчики обхода уже устарели, а опись обязана
- * описывать то, что лежит в файле, а не то, что было в середине сборки.
- */
-function countNames(rows) {
-  let russian = 0
-  let cyrillic = 0
-
-  for (const row of rows) {
-    if (row.russian !== '') russian++
-    if (CYRILLIC.test(row.russian)) cyrillic++
-  }
-
-  return { russian, cyrillic }
-}
-
-/** Пишет сжатый файл и возвращает строку описи: имя, размер, отпечаток. */
-function pack(name, payload) {
-  const body = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 })
-  writeFileSync(name, body)
-  return {
-    name,
-    bytes: body.length,
-    sha256: createHash('sha256').update(body).digest('hex'),
-  }
-}
-
-/** Печатает и в лог, и в итог прогона: за числами не надо лезть в артефакт. */
-function report(lines) {
-  const text = lines.join('\n')
-  console.log(`\n${text}\n`)
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`, 'utf8')
-  }
-}
-
-/** Строка отчёта о волне: пропущена, свёрнута или отработала целиком. */
-function waveLine(stat, done) {
-  if (stat.skipped) return 'выключена настройкой'
-  const tail = stat.gaveUp ? ', волна свёрнута досрочно' : ''
-  return `${done} за ${round1(stat.tookMs / 60000)} мин${tail}`
-}
-
-async function main() {
-  console.log(`Сборка: пауза ${PAUSE_MS} мс, перечисление каталога Шикимори`)
-
-  const baseline = await loadBaseline()
-  const { stat, rows, fresh } = await crawl()
-
-  // Пороги проверяются до волн: сначала убеждаемся, что сборка состоялась,
-  // и только потом тратим час на то, что делает её лучше.
-  if (rows.length < MIN_TITLES) {
-    fail(`собрано ${rows.length} названий при пороге ${MIN_TITLES}`)
-  }
-
-  if (baseline !== null) {
-    const floor = Math.floor(baseline.count * (1 - MAX_SHRINK))
-    if (rows.length < floor) {
-      fail(
-        `каталог усох: ${rows.length} записей против ${baseline.count} ` +
-          `в прошлом выпуске, порог ${floor}`,
-      )
-    }
-    if (fresh.maxId < baseline.maxId) {
-      fail(
-        `голова каталога уехала назад: ${fresh.maxId} против ${baseline.maxId} ` +
-          'в прошлом выпуске',
-      )
-    }
-  }
-
-  const fromShiki = countNames(rows)
-  const malIds = rows.map((row) => row.id)
-
-  // Готовых пар больше нет: манами отдавала 18 858 бесплатно, теперь волна
-  // спрашивает AniList про все номера. Пустой список означает ровно это.
-  const map = await enrichMap(malIds, [])
-  const extra = await enrichNames(rows)
-
-  for (const row of rows) {
-    if (row.russian !== '') continue
-    const found = extra.names.get(row.id)
-    if (found) row.russian = found
-  }
-
-  const pairs = map.pairs
-  const total = countNames(rows)
-
-  const builtAt = new Date().toISOString()
-  // Тег теперь свой, а не недельный тег манами: он называет голову каталога,
-  // которую видела эта сборка. По движению тега видно, что вход живой.
-  const sourceTag = `id-${fresh.maxId}`
-  const head = { v: 1, tag: sourceTag, builtAt }
-
-  const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
-  const mapFile = pack(FILE_MAP, { ...head, count: pairs.length, pairs })
-
-  // Версия описи остаётся первой: поля только добавляются, и старый клиент
-  // читает её как прежде. Поле count как было числом записей, так и осталось —
-  // менять смысл имеющегося поля значило бы соврать всем, кто уже его читает.
-  //
-  // names.known остаётся ради совместимости, но смысла в нём больше нет:
-  // при перечислении мы получаем ровно то, что каталог отдал, и доля узнанных
-  // номеров тождественно равна единице. Живую проверку делает сравнение
-  // с прошлым выпуском выше, а не этот порог.
-  //
-  // license — CC0-1.0, полный отказ от прав. Путь был такой: ODbL-1.0 стояла
-  // не по выбору, а приезжала вместе с производностью от манами; производности
-  // больше нет, а ни Шикимори, ни anime365, ни AniList условий на выгрузку
-  // через открытый API не налагают. Коротко стояла MIT — и тоже не к месту:
-  // это лицензия для кода, и требование возить её текст в копиях сводки
-  // номеров и названий — пустая формальность. CC0 говорит прямо про базы
-  // данных и права на извлечение данных — ровно про то, чем этот файл и является.
-  const index = {
-    version: 1,
-    builtAt,
-    source: 'shikimori',
-    sourceTag,
-    license: 'CC0-1.0',
-    names: {
-      source: stat.mirror,
-      count: rows.length,
-      russian: total.russian,
-      cyrillic: total.cyrillic,
-      known: 1,
-    },
-    // Свежесть содержимого, а не файла. Возраст выпуска сторож видит и без нас,
-    // а вот застывший вход виден только отсюда: голова каталога и число
-    // записей, начавших выходить за последние FRESH_DAYS дней. Сторож сравнивает
-    // maxId с текущей головой Шикимори и ловит застой, при котором выпуски
-    // выходят исправно, а содержимое в них не меняется.
-    freshness: {
-      maxId: fresh.maxId,
-      freshDays: FRESH_DAYS,
-      airedRecent: fresh.airedRecent,
-      released: fresh.released,
-      ongoing: fresh.ongoing,
-      anons: fresh.anons,
-    },
-    files: [titlesFile, mapFile],
-  }
-  writeFileSync(FILE_INDEX, `${JSON.stringify(index, null, 2)}\n`, 'utf8')
-
-  // Источник и лицензия называются в описании выпуска намеренно: тот, кто
-  // скачал файлы напрямую, за условиями в репозиторий не пойдёт. Атрибуция
-  // манами убрана вместе с самим манами, а вместе с ней ушла и ODbL-1.0:
-  // производной базы больше нет, и держать чужие условия не за что.
-  writeFileSync(
-    FILE_NOTES,
-    [
-      'Русские названия аниме для AniMori.',
-      '',
-      `Записей: ${rows.length}, с русским названием: ${total.russian}, ` +
-        `из них кириллицей: ${total.cyrillic}.`,
-      `Соответствий MAL — AniList: ${pairs.length}.`,
-      `Собрано ${builtAt} через ${stat.mirror}.`,
-      `Голова каталога — номер ${fresh.maxId}, за последние ${FRESH_DAYS} дней ` +
-        `начали выходить ${fresh.airedRecent} записей.`,
-      '',
-      'Номера и русские названия получены перечислением открытого API Шикимори',
-      'с параметром censored=false. Пары MAL — AniList дополнены с AniList,',
-      'пустые названия добраны с anime365.',
-      'Датасет выходит без прав и без условий: CC0-1.0, общественное достояние.',
-      'Пользуйтесь как угодно, спроса нет.',
-      '',
-      'Постоянный адрес описи:',
-      'https://github.com/foulnike/animori-data/releases/latest/download/index.json',
-      '',
-    ].join('\n'),
-    'utf8',
-  )
-
-  const titlesMb = round1(titlesFile.bytes / 1048576)
-  const mapMb = round1(mapFile.bytes / 1048576)
-  const codes = Object.entries(stat.codes)
-    .map(([code, count]) => `${code} × ${count}`)
-    .join(', ')
-  const baseLine =
-    baseline === null ? 'нет базы сравнения' : `${baseline.count} записей`
-
-  report([
-    `## Сборка датасета: ${sourceTag}`,
-    '',
-    '| Что | Сколько |',
-    '| --- | --- |',
-    `| Страниц каталога | ${stat.pages} |`,
-    `| Записей собрано | ${rows.length} |`,
-    `| Голова каталога | ${fresh.maxId} |`,
-    `| Прошлый выпуск | ${baseLine} |`,
-    `| Русское имя от Шикимори | ${fromShiki.russian} |`,
-    `| Добрано с anime365 | ${extra.stat.added} из ${extra.stat.empty} пустых |`,
-    `| Русское имя всего | ${total.russian} (${pct(total.russian / rows.length)}) |`,
-    `| Из них кириллицей | ${total.cyrillic} |`,
-    `| Пары добраны с AniList | ${map.stat.added} |`,
-    `| Пары всего | ${pairs.length} (${pct(pairs.length / rows.length)} от записей) |`,
-    `| Вышло за ${FRESH_DAYS} дн. | ${fresh.airedRecent} |`,
-    `| Состояния | released ${fresh.released}, ongoing ${fresh.ongoing}, anons ${fresh.anons} |`,
-    `| Запросов к Шикимори | ${stat.requests}, ответы: ${codes} |`,
-    `| Время обхода | ${round1(stat.tookMs / 60000)} мин через ${stat.mirror} |`,
-    `| Волна карты | ${waveLine(map.stat, `${map.stat.added} пар`)} |`,
-    `| Волна имён | ${waveLine(extra.stat, `${extra.stat.added} имён, ${extra.stat.latin} отброшено латиницей`)} |`,
-    `| ${FILE_TITLES} | ${titlesMb} МБ |`,
-    `| ${FILE_MAP} | ${mapMb} МБ |`,
-    '',
-    '**Файлы собраны. Публикация — следующим шагом, если она включена.**',
-  ])
-}
-
-await main()
+ * Пересчёт имён по готовым записям. Считается в конце, а не по ходу 
