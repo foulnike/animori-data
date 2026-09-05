@@ -13,10 +13,11 @@
 // запросов вместо шестисот десяти. И, что важнее, неделя, в которую AniList
 // не отвечает вовсе, отдаёт в выпуск карту прошлой недели, а не пустой файл:
 // до семени волна в такой неделе сворачивалась по пяти отказам, карта уходила
-// пустой, и пороги приёмки этого не замечали — они стоят до волн.
+// пустой, и пороги приёмки этого не замечали — они стоят до волн, а своей
+// проверки у карты не было.
 // Плата за семя — карта умеет застывать незаметно, ровно как застыл бы вход
-// на манами. Поэтому её возраст назван в описи, в самом файле карты
-// и в описании выпуска, а порог приёмки у карты теперь свой.
+// на манами. Поэтому её возраст назван в описи, в самом файле карты и в
+// описании выпуска, а порог приёмки у карты теперь свой.
 //
 // ПОЧЕМУ НЕ МАНАМИ. Раньше номера MyAnimeList брались из выпусков
 // manami-project/anime-offline-database. 4 июля 2026 репозиторий переведён
@@ -29,8 +30,8 @@
 // limit=50, то есть 610 страниц против 612 запросов у прежнего обхода по
 // явным ids. Обход не подорожал. Даром достались status и aired_on у каждой
 // записи — на них считаются счётчики свежести для описи. Волна карты дорожала
-// лишь однажды: пока семени не было, она спрашивала про все тридцать тысяч
-// номеров. С семенем прошлого выпуска цена вернулась к прежней, и чужой
+// лишь однажды: пока семени не было, она спрашивала AniList про все тридцать
+// тысяч номеров. С семенем прошлого выпуска цена вернулась к прежней, и чужой
 // архив для этого не понадобился.
 //
 // ЛОВУШКА ЦЕНЗУРЫ. Перечисление без censored=false отдаёт урезанный каталог
@@ -64,11 +65,6 @@ const BATCH = 50
  * проб и отдаёт настоящие пути постеров, io отказал один раз из шести,
  * one — дважды из четырёх. Поэтому rip теперь первый, а one остался
  * последним запасным ходом, а не первым выбором, как было раньше.
- *
- * Замер сделан с раннеров GitHub, то есть из-за границы. У клиента свой
- * порядок в SHIKI_DOMAINS и свои причины: там адрес российский, и смысл .rip
- * именно в обходе блокировки. Переносить этот порядок в клиент без замера
- * с клиентской стороны нельзя.
  */
 const MIRRORS = ['shikimori.rip', 'shikimori.io', 'shikimori.one']
 /** После скольких отказов подряд обход уходит на следующий адрес. */
@@ -183,7 +179,7 @@ async function loadBaseline() {
  *
  * Отпечаток сверяется до распаковки, как это делает клиент в api/dataset.ts:
  * половина архива, разобранная в пары, хуже отсутствия семени. Пары приходят
- * из своего же выпуска, но проверяются как чужие: порченая пара тихо увела бы
+ * из своего же выпуска, но проверяются как чужие — порченая пара тихо увела бы
  * клиента на чужой тайтл, и найти такое потом почти нельзя.
  */
 async function loadSeed(mapFile) {
@@ -408,4 +404,278 @@ async function crawl() {
 }
 
 /**
- * Пересчёт имён по готовым записям. Считается в конце, а не по ходу 
+ * Пересчёт имён по готовым записям. Считается в конце, а не по ходу обхода:
+ * после волны anime365 счётчики обхода уже устарели, а опись обязана
+ * описывать то, что лежит в файле, а не то, что было в середине сборки.
+ */
+function countNames(rows) {
+  let russian = 0
+  let cyrillic = 0
+
+  for (const row of rows) {
+    if (row.russian !== '') russian++
+    if (CYRILLIC.test(row.russian)) cyrillic++
+  }
+
+  return { russian, cyrillic }
+}
+
+/** Пишет сжатый файл и возвращает строку описи: имя, размер, отпечаток. */
+function pack(name, payload) {
+  const body = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 })
+  writeFileSync(name, body)
+  return {
+    name,
+    bytes: body.length,
+    sha256: createHash('sha256').update(body).digest('hex'),
+  }
+}
+
+/** Печатает и в лог, и в итог прогона: за числами не надо лезть в артефакт. */
+function report(lines) {
+  const text = lines.join('\n')
+  console.log(`\n${text}\n`)
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`, 'utf8')
+  }
+}
+
+/**
+ * Строка отчёта о волне: пропущена, свёрнута или отработала целиком.
+ * Про disabled знает только волна карты, у волны имён поля нет — и не надо.
+ */
+function waveLine(stat, done) {
+  if (stat.skipped) return 'выключена настройкой'
+  if (stat.disabled) return 'сторонний доступ к AniList закрыт, волна свёрнута сразу'
+  const tail = stat.gaveUp ? ', волна свёрнута досрочно' : ''
+  return `${done} за ${round1(stat.tookMs / 60000)} мин${tail}`
+}
+
+async function main() {
+  console.log(`Сборка: пауза ${PAUSE_MS} мс, перечисление каталога Шикимори`)
+
+  const baseline = await loadBaseline()
+  const { stat, rows, fresh } = await crawl()
+
+  // Пороги проверяются до волн: сначала убеждаемся, что сборка состоялась,
+  // и только потом тратим час на то, что делает её лучше.
+  if (rows.length < MIN_TITLES) {
+    fail(`собрано ${rows.length} названий при пороге ${MIN_TITLES}`)
+  }
+
+  if (baseline !== null) {
+    const floor = Math.floor(baseline.count * (1 - MAX_SHRINK))
+    if (rows.length < floor) {
+      fail(
+        `каталог усох: ${rows.length} записей против ${baseline.count} ` +
+          `в прошлом выпуске, порог ${floor}`,
+      )
+    }
+    if (fresh.maxId < baseline.maxId) {
+      fail(
+        `голова каталога уехала назад: ${fresh.maxId} против ${baseline.maxId} ` +
+          'в прошлом выпуске',
+      )
+    }
+  }
+
+  const fromShiki = countNames(rows)
+  const malIds = rows.map((row) => row.id)
+
+  // Семя качается после порогов: если сборка не состоялась, тратить сеть
+  // на карту прошлого выпуска незачем.
+  const seed = baseline === null ? null : await loadSeed(baseline.mapFile)
+
+  const map = await enrichMap(malIds, seed === null ? [] : seed.pairs)
+  const extra = await enrichNames(rows)
+
+  for (const row of rows) {
+    if (row.russian !== '') continue
+    const found = extra.names.get(row.id)
+    if (found) row.russian = found
+  }
+
+  const pairs = map.pairs
+  const total = countNames(rows)
+
+  // Порог приёмки карты. У имён он был с самого начала, у карты не было вовсе —
+  // и это ровно та щель, через которую пустая карта уезжала бы в выпуск при
+  // зелёном прогоне. Первый прогон в пустом репозитории освобождён, как и
+  // проверка усадки выше: наследовать ему нечего.
+  if (baseline !== null) {
+    if (seed !== null) {
+      const floor = Math.floor(seed.pairs.length * (1 - MAX_SHRINK))
+      if (pairs.length < floor) {
+        fail(
+          `карта усохла: ${pairs.length} пар против ${seed.pairs.length} ` +
+            `в семени, порог ${floor}`,
+        )
+      }
+    } else if (pairs.length === 0) {
+      fail('карта пуста: семя не скачалось, а волна ничего не добрала')
+    }
+  }
+
+  const builtAt = new Date().toISOString()
+  // Тег теперь свой, а не недельный тег манами: он называет голову каталога,
+  // которую видела эта сборка. По движению тега видно, что вход живой.
+  const sourceTag = `id-${fresh.maxId}`
+  const head = { v: 1, tag: sourceTag, builtAt }
+
+  // Возраст карты. Свёрнутая или выключенная волна не добавляет ни одной пары —
+  // тогда карта в выпуске тождественна семени, и называть её сегодняшней было бы
+  // ложью. Отличать это от «волна отработала, новых номеров не нашлось»
+  // обязательно: во втором случае карта именно сегодняшняя, и added там ноль
+  // по совершенно другой причине.
+  const mapStalled = map.stat.added === 0 && (map.stat.gaveUp || map.stat.skipped)
+  const mapAged = mapStalled && seed !== null
+  const mapFrom = mapAged ? seed.tag : sourceTag
+  const mapBuiltAt = mapAged ? seed.builtAt : builtAt
+  const mapWave = map.stat.skipped
+    ? 'выключена'
+    : map.stat.disabled
+      ? 'доступ закрыт'
+      : map.stat.gaveUp
+        ? 'свёрнута'
+        : 'отработала'
+
+  const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
+  // У карты своя голова: когда она унаследована, тег и дата в файле обязаны
+  // называть выпуск, из которого пары пришли, а не сегодняшний прогон. Иначе
+  // файл врёт сам про себя, и застой не виден даже в нём.
+  const mapHead = { v: 1, tag: mapFrom, builtAt: mapBuiltAt }
+  const mapFile = pack(FILE_MAP, { ...mapHead, count: pairs.length, pairs })
+
+  // Версия описи остаётся первой: поля только добавляются, и старый клиент
+  // читает её как прежде. Поле count как было числом записей, так и осталось —
+  // менять смысл имеющегося поля значило бы соврать всем, кто уже его читает.
+  //
+  // names.known остаётся ради совместимости, но смысла в нём больше нет:
+  // при перечислении мы получаем ровно то, что каталог отдал, и доля узнанных
+  // номеров тождественно равна единице. Живую проверку делает сравнение
+  // с прошлым выпуском выше, а не этот порог.
+  //
+  // license — CC0-1.0, полный отказ от прав. Путь был такой: ODbL-1.0 стояла
+  // не по выбору, а приезжала вместе с производностью от манами; производности
+  // больше нет, а ни Шикимори, ни anime365, ни AniList условий на выгрузку
+  // через открытый API не налагают. Коротко стояла MIT — и тоже не к месту:
+  // это лицензия для кода, и требование возить её текст в копиях сводки
+  // номеров и названий — пустая формальность. CC0 говорит прямо про базы
+  // данных и права на извлечение данных — ровно про то, чем этот файл и является.
+  const index = {
+    version: 1,
+    builtAt,
+    source: 'shikimori',
+    sourceTag,
+    license: 'CC0-1.0',
+    names: {
+      source: stat.mirror,
+      count: rows.length,
+      russian: total.russian,
+      cyrillic: total.cyrillic,
+      known: 1,
+    },
+    // Карта отдельным разделом. Клиенту он не нужен — тот читает files, —
+    // а сторожу и человеку нужен: без возраста карты застой в ней неотличим
+    // от исправной сборки, ведь число пар остаётся то же самое.
+    map: {
+      count: pairs.length,
+      from: mapFrom,
+      builtAt: mapBuiltAt,
+      inherited: mapAged,
+      added: map.stat.added,
+      seeded: map.stat.seeded,
+      wave: mapWave,
+    },
+    // Свежесть содержимого, а не файла. Возраст выпуска сторож видит и без нас,
+    // а вот застывший вход виден только отсюда: голова каталога и число
+    // записей, начавших выходить за последние FRESH_DAYS дней. Сторож сравнивает
+    // maxId с текущей головой Шикимори и ловит застой, при котором выпуски
+    // выходят исправно, а содержимое в них не меняется.
+    freshness: {
+      maxId: fresh.maxId,
+      freshDays: FRESH_DAYS,
+      airedRecent: fresh.airedRecent,
+      released: fresh.released,
+      ongoing: fresh.ongoing,
+      anons: fresh.anons,
+    },
+    files: [titlesFile, mapFile],
+  }
+  writeFileSync(FILE_INDEX, `${JSON.stringify(index, null, 2)}\n`, 'utf8')
+
+  // Источник и лицензия называются в описании выпуска намеренно: тот, кто
+  // скачал файлы напрямую, за условиями в репозиторий не пойдёт. Атрибуция
+  // манами убрана вместе с самим манами, а вместе с ней ушла и ODbL-1.0:
+  // производной базы больше нет, и держать чужие условия не за что.
+  writeFileSync(
+    FILE_NOTES,
+    [
+      'Русские названия аниме для AniMori.',
+      '',
+      `Записей: ${rows.length}, с русским названием: ${total.russian}, ` +
+        `из них кириллицей: ${total.cyrillic}.`,
+      mapAged
+        ? `Соответствий MAL — AniList: ${pairs.length}. Карта унаследована ` +
+          `от выпуска ${mapFrom} (${mapBuiltAt}): AniList в этот прогон не ответил.`
+        : `Соответствий MAL — AniList: ${pairs.length}, добрано в этот прогон: ` +
+          `${map.stat.added}.`,
+      `Собрано ${builtAt} через ${stat.mirror}.`,
+      `Голова каталога — номер ${fresh.maxId}, за последние ${FRESH_DAYS} дней ` +
+        `начали выходить ${fresh.airedRecent} записей.`,
+      '',
+      'Номера и русские названия получены перечислением открытого API Шикимори',
+      'с параметром censored=false. Пары MAL — AniList дополнены с AniList,',
+      'пустые названия добраны с anime365.',
+      'Датасет выходит без прав и без условий: CC0-1.0, общественное достояние.',
+      'Пользуйтесь как угодно, спроса нет.',
+      '',
+      'Постоянный адрес описи:',
+      'https://github.com/foulnike/animori-data/releases/latest/download/index.json',
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+
+  const titlesMb = round1(titlesFile.bytes / 1048576)
+  const mapMb = round1(mapFile.bytes / 1048576)
+  const codes = Object.entries(stat.codes)
+    .map(([code, count]) => `${code} × ${count}`)
+    .join(', ')
+  const baseLine =
+    baseline === null ? 'нет базы сравнения' : `${baseline.count} записей`
+  const seedLine =
+    seed === null ? 'нет' : `${seed.pairs.length} пар от ${seed.tag || 'без тега'}`
+  const mapAgeLine = mapAged ? `унаследована от ${mapFrom}, ${mapBuiltAt}` : 'этот прогон'
+
+  report([
+    `## Сборка датасета: ${sourceTag}`,
+    '',
+    '| Что | Сколько |',
+    '| --- | --- |',
+    `| Страниц каталога | ${stat.pages} |`,
+    `| Записей собрано | ${rows.length} |`,
+    `| Голова каталога | ${fresh.maxId} |`,
+    `| Прошлый выпуск | ${baseLine} |`,
+    `| Русское имя от Шикимори | ${fromShiki.russian} |`,
+    `| Добрано с anime365 | ${extra.stat.added} из ${extra.stat.empty} пустых |`,
+    `| Русское имя всего | ${total.russian} (${pct(total.russian / rows.length)}) |`,
+    `| Из них кириллицей | ${total.cyrillic} |`,
+    `| Семя карты | ${seedLine} |`,
+    `| Пары добраны с AniList | ${map.stat.added} |`,
+    `| Пары всего | ${pairs.length} (${pct(pairs.length / rows.length)} от записей) |`,
+    `| Возраст карты | ${mapAgeLine} |`,
+    `| Вышло за ${FRESH_DAYS} дн. | ${fresh.airedRecent} |`,
+    `| Состояния | released ${fresh.released}, ongoing ${fresh.ongoing}, anons ${fresh.anons} |`,
+    `| Запросов к Шикимори | ${stat.requests}, ответы: ${codes} |`,
+    `| Время обхода | ${round1(stat.tookMs / 60000)} мин через ${stat.mirror} |`,
+    `| Волна карты | ${waveLine(map.stat, `${map.stat.added} пар`)} |`,
+    `| Волна имён | ${waveLine(extra.stat, `${extra.stat.added} имён, ${extra.stat.latin} отброшено латиницей`)} |`,
+    `| ${FILE_TITLES} | ${titlesMb} МБ |`,
+    `| ${FILE_MAP} | ${mapMb} МБ |`,
+    '',
+    '**Файлы собраны. Публикация — следующим шагом, если она включена.**',
+  ])
+}
+
+await main()
