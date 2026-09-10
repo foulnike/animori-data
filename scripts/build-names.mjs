@@ -1,26 +1,26 @@
 // Сборщик датасета русских названий (шаг 4 в docs/DATA-PIPELINE.md приложения).
 //
-// Обходит каталог Шикимори (scripts/crawl.mjs) и складывает рядом с собой
-// три файла: имена, карту номеров и опись с отпечатками. Их подбирает шаг
-// выпуска. Здесь живут пороги приёмки, семена прошлого выпуска, выбор вида
-// обхода, две волны обогащения и запись файлов.
+// Здесь живут семена прошлого выпуска, выбор вида обхода, пороги приёмки
+// и две волны обогащения. Перечисление каталога — в scripts/crawl.mjs,
+// запись трёх файлов и отчёт — в scripts/release-files.mjs.
 //
-// Волны обогащения обе необязательные: карта дополняется с AniList, пустые
-// имена добираются с anime365. Они стоят после порогов намеренно — сначала
-// мы знаем, что сборка состоялась, и только потом тратим час на то, что
-// улучшает её, но не решает судьбу.
+// Волны обе необязательные: карта дополняется с AniList, пустые имена
+// добираются с anime365. Они стоят после порогов намеренно — сначала мы знаем,
+// что сборка состоялась, и только потом тратим час на то, что улучшает её,
+// но не решает судьбу.
 //
 // ВИД ОБХОДА. Обычная неделя идёт частичным обходом: семенем берётся файл
 // имён прошлого выпуска, а у Шикимори спрашивается только то, что впрямь
-// могло измениться. Полный обход случается, когда наследовать нечего (первый
-// прогон, потеря или порча семени) или со времени прошлого полного вышло
-// больше FULL_EVERY_DAYS дней: редкие правки названий у вышедшего частичный
-// обход не видит, и копиться им вечно нельзя. Отметка последнего полного
-// живёт в самой описи (names.fullAt), поэтому сборщику не нужно ни состояние
-// в репозитории, ни памяти между прогонами. BUILD_MODE=full и partial говорят прямо.
+// могло измениться: хвост за прошлой головой и весь список идущего
+// и анонсов. Полный обход случается, когда наследовать нечего (первый прогон,
+// потеря или порча семени) или со времени прошлого полного вышло больше
+// FULL_EVERY_DAYS дней: редкие правки названий у вышедшего частичный обход
+// не видит, и копиться им вечно нельзя. Отметка последнего полного живёт
+// в самой описи (names.fullAt), поэтому ни состояния в репозитории, ни памяти
+// между прогонами не требуется. BUILD_MODE=full и partial говорят прямо.
 //
 // СЕМЯ ИМЁН. Файл прошлого выпуска качается с постоянного адреса, отпечаток
-// сверяется до распаковки, как это делает клиент в api/dataset.ts. Порченое или
+// сверяется до распаковки, как делает клиент в api/dataset.ts. Порченое или
 // подозрительно маленькое семя отбрасывается целиком, и обход становится
 // полным: половина каталога хуже, чем лишние десять минут сети.
 //
@@ -34,10 +34,9 @@
 //
 // ПОЧЕМУ НЕ МАНАМИ. Раньше номера MyAnimeList брались из выпусков
 // manami-project/anime-offline-database. 4 июля 2026 репозиторий переведён в архив:
-// он доступен только для чтения, и новых недельных выпусков не будет. Вход
-// конвейера навсегда замер бы на теге 2026-27, а пороги приёмки этого
-// не заметили бы никогда: при замороженном входе они остаются зелёными вечно.
-// Поэтому универсум номеров собирается сам, перечислением каталога.
+// новых недельных выпусков не будет. Вход конвейера навсегда замер бы на
+// теге 2026-27, а пороги приёмки этого не заметили бы никогда: при замороженном
+// входе они остаются зелёными вечно. Поэтому универсум номеров собирается сам.
 //
 // Сам не публикует ничего и в репозиторий не пишет: публикация — отдельный
 // шаг workflow, и он не выполнится, если сборка упала. Половина датасета
@@ -46,13 +45,14 @@
 // Зависимостей нет намеренно: всё нужное есть в Node из коробки.
 
 import { createHash } from 'node:crypto'
-import { appendFileSync, writeFileSync } from 'node:fs'
-import { gunzipSync, gzipSync } from 'node:zlib'
+import { appendFileSync } from 'node:fs'
+import { gunzipSync } from 'node:zlib'
 
-import { pct, round1, why } from './common.mjs'
+import { why } from './common.mjs'
 import { TIMEOUT_MS, UA, crawlFull, crawlPartial } from './crawl.mjs'
 import { enrichMap } from './enrich-map.mjs'
 import { enrichNames } from './enrich-names.mjs'
+import { FILE_INDEX, FILE_MAP, FILE_TITLES, writeRelease } from './release-files.mjs'
 
 /**
  * Файлы прошлого выпуска: база сравнения для порогов и семена для обхода
@@ -76,8 +76,7 @@ const MAX_SHRINK = 0.05
 const FRESH_DAYS = 180
 /**
  * Через сколько дней частичные обходы обязаны уступить полному. Тридцать —
- * это четыре-пять недельных прогонов подряд: правки названий у вышедшего
- * редки, но копиться вечно им нельзя.
+ * это четыре-пять недельных прогонов подряд.
  */
 const FULL_EVERY_DAYS = 30
 const DAY_MS = 86400000
@@ -86,11 +85,6 @@ const CYRILLIC = /[А-Яа-яЁё]/
 const PAUSE_MS = Number(process.env.BUILD_PAUSE || 700)
 /** auto — решает отметка полного обхода в описи; full и partial говорят прямо. */
 const MODE = String(process.env.BUILD_MODE || 'auto').toLowerCase()
-
-const FILE_TITLES = 'titles-anime.json.gz'
-const FILE_MAP = 'map-mal-anilist.json.gz'
-const FILE_INDEX = 'index.json'
-const FILE_NOTES = 'release-notes.md'
 
 /**
  * Падаем громко: тихий выход с нулём — это ложный зелёный прогон и, что хуже,
@@ -114,8 +108,8 @@ function fileRef(files, name) {
 /**
  * Опись прошлого выпуска. Отказ чтения не роняет сборку: первый прогон
  * в пустом репозитории базы сравнения не имеет, и это законно. Проверка
- * усадки тогда просто не делается, порог по количеству остаётся, а обход
- * идёт полный — наследовать нечего.
+ * усадки тогда не делается, порог по количеству остаётся, а обход идёт
+ * полный — наследовать нечего.
  */
 async function loadBaseline() {
   try {
@@ -362,8 +356,7 @@ function countFreshness(rows, ongoing, anons) {
 
     // aired_on бывает null и бывает в будущем: у анонсов там дата следующего
     // года, встречались 2026-10-04 и 2027-01-01. Поэтому окно закрыто с двух
-    // сторон, а анонсы в счёт свежести не идут вовсе. Из-за них максимум
-    // по aired_on негоден как метрика в принципе.
+    // сторон, а анонсы в счёт свежести не идут вовсе.
     if (anons.has(row.id)) continue
     const aired = typeof row.aired_on === 'string' ? row.aired_on : ''
     if (aired >= recentFrom && aired <= today) airedRecent++
@@ -379,49 +372,16 @@ function countFreshness(rows, ongoing, anons) {
   }
 }
 
-/** Пишет сжатый файл и возвращает строку описи: имя, размер, отпечаток. */
-function pack(name, payload) {
-  const body = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 })
-  writeFileSync(name, body)
-  return {
-    name,
-    bytes: body.length,
-    sha256: createHash('sha256').update(body).digest('hex'),
-  }
-}
-
-/** Печатает и в лог, и в итог прогона: за числами не надо лезть в артефакт. */
-function report(lines) {
-  const text = lines.join('\n')
-  console.log(`\n${text}\n`)
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`, 'utf8')
-  }
-}
-
-/**
- * Строка отчёта о волне: пропущена, свёрнута или отработала целиком.
- * Про disabled знает только волна карты, у волны имён поля нет — и не надо.
- */
-function waveLine(stat, done) {
-  if (stat.skipped) return 'выключена настройкой'
-  if (stat.disabled) return 'сторонний доступ к AniList закрыт, волна свёрнута сразу'
-  const tail = stat.gaveUp ? ', волна свёрнута досрочно' : ''
-  return `${done} за ${round1(stat.tookMs / 60000)} мин${tail}`
-}
-
 async function main() {
-  console.log(`Сборка: пауза ${PAUSE_MS} мс, перечисление каталога Шикимори`)
+  console.log(`Сборка: пауза ${PAUSE_MS} мс, каталог Шикимори`)
 
   const baseline = await loadBaseline()
   // Семя имён качается до обхода: от него зависит сам вид обхода.
   const seedTitles = baseline === null ? null : await loadSeedTitles(baseline.titlesFile)
   const full = wantsFull(baseline, seedTitles)
 
-  const crawled = full
-    ? await crawlFull(fail)
-    : await crawlPartial(seedTitles.rows, fail)
-  const { stat, rows, ongoing, anons } = crawled
+  const crawled = full ? await crawlFull(fail) : await crawlPartial(seedTitles.rows, fail)
+  const { stat, rows, ongoing, anons, mode, added, changed } = crawled
 
   // Пороги проверяются до волн: сначала убеждаемся, что сборка состоялась,
   // и только потом тратим час на то, что делает её лучше.
@@ -488,7 +448,6 @@ async function main() {
   // Тег свой, а не недельный тег манами: он называет голову каталога,
   // которую видела эта сборка. По движению тега видно, что вход живой.
   const sourceTag = `id-${fresh.maxId}`
-  const head = { v: 1, tag: sourceTag, builtAt }
   // Отметка полного обхода передаётся из выпуска в выпуск: именно она решает
   // вид следующего обхода, и другого места для неё нет.
   const fullAt = full ? builtAt : baseline.fullAt
@@ -510,15 +469,29 @@ async function main() {
         ? 'свёрнута'
         : 'отработала'
 
-  const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
-  // У карты своя голова: когда она унаследована, тег и дата в файле обязаны
-  // называть выпуск, из которого пары пришли, а не сегодняшний прогон.
-  const mapHead = { v: 1, tag: mapFrom, builtAt: mapBuiltAt }
-  const mapFile = pack(FILE_MAP, { ...mapHead, count: pairs.length, pairs })
+  writeRelease({
+    rows,
+    pairs,
+    fresh,
+    total,
+    fromShiki,
+    stat,
+    map,
+    extra,
+    builtAt,
+    sourceTag,
+    fullAt,
+    mode,
+    added,
+    changed,
+    mapFrom,
+    mapBuiltAt,
+    mapAged,
+    mapWave,
+    baseline,
+    seed,
+    seedTitles,
+  })
+}
 
-  // Версия описи остаётся первой: поля только добавляются, и старый клиент
-  // читает её как прежде. Поле count как было числом записей, так и осталось.
-  //
-  // names.known остаётся ради совместимости, но смысла в нём больше нет:
-  // при перечислении мы получаем ровно то, что каталог отдал. Живую проверку
-  // делает сравнение с прошлым выпуском выше, а не этот по
+await main()
