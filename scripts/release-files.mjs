@@ -49,6 +49,41 @@ export function waveLine(stat, done) {
 }
 
 /**
+ * Разница против прошлого выпуска: новых записей, правок и пропаж.
+ *
+ * Частичный обход считает новых и обновлённых сам — он идёт от семени,
+ * и другого способа у него нет. Полный обход семени не видит вовсе и
+ * возвращает «новых столько же, сколько записей»: это не факт о каталоге,
+ * а способ сказать «перечислено всё заново». В отчёте такое число врёт —
+ * прогон 14 сентября 2026 объявил 30 545 новых записей при шестидесяти
+ * четырёх настоящих. Поэтому при полном обходе разница считается здесь,
+ * по тому самому семени, которое всё равно качалось ради выбора вида обхода.
+ *
+ * Пропажи видны только отсюда: узнать о них, не перечислив каталог целиком,
+ * нельзя, и частичный обход их не замечает принципиально.
+ */
+export function diffSeed(rows, seedRows) {
+  const was = new Map()
+  for (const row of seedRows) was.set(row.id, row)
+
+  let added = 0
+  let changed = 0
+
+  for (const row of rows) {
+    const known = was.get(row.id)
+    if (known === undefined) {
+      added++
+      continue
+    }
+    if (known.russian !== row.russian || known.aired_on !== row.aired_on) changed++
+    // Остаток карты — это записи семени, которых в каталоге больше нет.
+    was.delete(row.id)
+  }
+
+  return { added, changed, gone: was.size }
+}
+
+/**
  * Складывает выпуск: два сжатых файла, опись и описание, и печатает
  * таблицу итога.
  *
@@ -73,9 +108,12 @@ export function waveLine(stat, done) {
  * это лицензия для кода. CC0 говорит прямо про базы данных и права
  * на извлечение данных — ровно про то, чем эти файлы и являются.
  *
- * mapRebuild — просьба пересобрать карту без семени. В отчёте она названа
- * намеренно: семя в таком прогоне скачано и служит порогом приёмки,
- * но в волну не шло, и строка «Семя карты: 20929 пар» без оговорки врала бы.
+ * mapRebuild — прогон, в котором пары спрошены у AniList заново целиком.
+ * Семя в таком прогоне не отменяется, а служит опорой: пара уходит из карты
+ * только там, где AniList ответил успешно и пары в ответе не оказалось,
+ * а номер, до которого волна не дошла, остаётся как в семени. Поэтому
+ * в отчёте названы обе стороны правки — и добор, и уборка: пересборка
+ * умеет уменьшать карту, и молчать об этом нельзя.
  */
 export function writeRelease(ctx) {
   const {
@@ -103,6 +141,13 @@ export function writeRelease(ctx) {
     seedTitles,
   } = ctx
 
+  // Разница против прошлого выпуска. Частичный обход принёс её с собой,
+  // полному считаем её здесь: его собственные числа значат другое.
+  const diff =
+    mode === 'full' && seedTitles !== null
+      ? diffSeed(rows, seedTitles.rows)
+      : { added, changed, gone: null }
+
   const head = { v: 1, tag: sourceTag, builtAt }
   const titlesFile = pack(FILE_TITLES, { ...head, count: rows.length, titles: rows })
   // У карты своя голова: когда она унаследована, тег и дата в файле обязаны
@@ -125,8 +170,11 @@ export function writeRelease(ctx) {
       known: 1,
       mode,
       fullAt,
-      added,
-      changed,
+      added: diff.added,
+      changed: diff.changed,
+      // Пропажи считает только полный обход; у частичного здесь null,
+      // и это честнее нуля: ноль читался бы как «никто не пропал».
+      gone: diff.gone,
     },
     // Карта отдельным разделом. Клиенту он не нужен — тот читает files, —
     // а сторожу и человеку нужен: без возраста карты застой в ней неотличим
@@ -134,7 +182,9 @@ export function writeRelease(ctx) {
     //
     // rebuilt называет прогоны, в которых пары спрошены заново целиком:
     // иначе по выпуску не отличить освежённую карту от наращенной поверх
-    // старого ядра.
+    // старого ядра. Рядом с added стоят changed и dropped: пересборка умеет
+    // и переносить пару на другой номер, и убирать её вовсе, а по одному
+    // числу пар этого не видно.
     map: {
       count: pairs.length,
       from: mapFrom,
@@ -142,6 +192,9 @@ export function writeRelease(ctx) {
       inherited: mapAged,
       rebuilt: mapRebuild === true,
       added: map.stat.added,
+      changed: map.stat.changed,
+      dropped: map.stat.dropped,
+      kept: map.stat.kept,
       seeded: map.stat.seeded,
       wave: mapWave,
     },
@@ -173,8 +226,9 @@ export function writeRelease(ctx) {
         ? `Соответствий MAL — AniList: ${pairs.length}. Карта унаследована ` +
           `от выпуска ${mapFrom} (${mapBuiltAt}): AniList в этот прогон не ответил.`
         : mapRebuild
-          ? `Соответствий MAL — AniList: ${pairs.length}. Карта собрана заново ` +
-            'целиком: семя прошлого выпуска в волну не шло.'
+          ? `Соответствий MAL — AniList: ${pairs.length}. Карта переспрошена ` +
+            `у AniList целиком: добрано ${map.stat.added}, убрано ${map.stat.dropped} ` +
+            'пар, отсутствие которых AniList подтвердил ответом.'
           : `Соответствий MAL — AniList: ${pairs.length}, добрано в этот прогон: ` +
             `${map.stat.added}.`,
       `Собрано ${builtAt} через ${stat.mirror}, обход ` +
@@ -201,9 +255,10 @@ export function writeRelease(ctx) {
     .map(([code, count]) => `${code} × ${count}`)
     .join(', ')
   const baseLine = baseline === null ? 'нет базы сравнения' : `${baseline.count} записей`
-  // При пересборке семя скачано и служит порогом приёмки, но в волну не
-  // шло: строка без оговорки читалась бы как обычный прогон.
-  const seedTail = mapRebuild ? ', в волну не шло: пересборка' : ''
+  // При пересборке семя не отменяется, а держит карту: пара уходит только
+  // по успешному ответу AniList без неё. Строка говорит об этом прямо —
+  // прежде она говорила обратное, и это было неправдой.
+  const seedTail = mapRebuild ? ', опора пересборки' : ''
   const seedLine =
     seed === null ? 'нет' : `${seed.pairs.length} пар от ${seed.tag || 'без тега'}${seedTail}`
   const seedTitlesLine =
@@ -215,6 +270,11 @@ export function writeRelease(ctx) {
     : mapRebuild
       ? 'этот прогон, собрана заново целиком'
       : 'этот прогон'
+  const diffLine = seedTitles === null ? 'нет базы сравнения' : String(diff.added)
+  const changedLine = seedTitles === null ? 'нет базы сравнения' : String(diff.changed)
+  const mapEdits =
+    `добрано ${map.stat.added}, переехало ${map.stat.changed}, убрано ${map.stat.dropped}` +
+    (map.stat.kept > 0 ? `, оставлено от семени ${map.stat.kept}` : '')
 
   report([
     `## Сборка датасета: ${sourceTag}`,
@@ -225,8 +285,9 @@ export function writeRelease(ctx) {
     `| Семя имён | ${seedTitlesLine} |`,
     `| Страниц каталога | ${stat.pages} |`,
     `| Записей всего | ${rows.length} |`,
-    `| Новых за прогон | ${added} |`,
-    `| Обновлённых записей | ${changed} |`,
+    `| Новых против прошлого выпуска | ${diffLine} |`,
+    `| Обновлённых записей | ${changedLine} |`,
+    ...(diff.gone === null ? [] : [`| Пропало из каталога | ${diff.gone} |`]),
     `| Голова каталога | ${fresh.maxId} |`,
     `| Прошлый выпуск | ${baseLine} |`,
     `| Русское имя от Шикимори | ${fromShiki.russian} |`,
@@ -234,7 +295,7 @@ export function writeRelease(ctx) {
     `| Русское имя всего | ${total.russian} (${pct(total.russian / rows.length)}) |`,
     `| Из них кириллицей | ${total.cyrillic} |`,
     `| Семя карты | ${seedLine} |`,
-    `| Пары добраны с AniList | ${map.stat.added} |`,
+    `| Правки карты | ${mapEdits} |`,
     `| Пары всего | ${pairs.length} (${pct(pairs.length / rows.length)} от записей) |`,
     `| Возраст карты | ${mapAgeLine} |`,
     `| Вышло за ${fresh.freshDays} дн. | ${fresh.airedRecent} |`,
