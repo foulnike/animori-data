@@ -20,6 +20,8 @@
 // ВОЛНА НЕОБЯЗАТЕЛЬНАЯ и идёт последней: источник отвечает 403 и пятисотыми
 // от Cloudflare пачками, а сборка не вправе от него зависеть. У волны есть
 // свой бюджет времени: она обязана уступить место выпуску, а не съесть его.
+// Сверх своего бюджета волна принимает ещё и срок от сборщика: общее время
+// прогона делится на всех, и последняя волна не вправе его перебрать.
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -36,8 +38,12 @@ const PAUSE_MS = Number(process.env.NAMES_PAUSE || 700)
 const SWITCH_AFTER = 3
 /** После скольких отказов подряд волна сдаётся целиком. */
 const GIVE_UP_AFTER = 12
-/** Бюджет волны в минутах. Раньше кончится он — раньше кончится и волна. */
-const BUDGET_MS = Number(process.env.NAMES_BUDGET || 60) * 60000
+/**
+ * Бюджет волны в минутах. Раньше кончится он — раньше кончится и волна.
+ * Вынесен наружу: сборщик считает по нему общий план времени прогона,
+ * чтобы волна имён не осталась без своей доли.
+ */
+export const NAMES_BUDGET_MS = Number(process.env.NAMES_BUDGET || 60) * 60000
 const REPORT_EVERY = 200
 const CYRILLIC = /[А-Яа-яЁё]/
 const UA = 'AniMori/3.0 (+https://github.com/foulnike/animori-data)'
@@ -120,8 +126,10 @@ async function ask(domain, malId) {
  * Возвращает карту «номер MAL → русское имя» и статистику волны.
  *
  * @param rows записи обхода Шикимори
+ * @param deadline время в мс, позже которого волне работать нельзя. Свой
+ *   бюджет волна берёт меньшим из двух: NAMES_BUDGET_MS и этого срока.
  */
-export async function enrichNames(rows) {
+export async function enrichNames(rows, deadline = Infinity) {
   const stat = {
     skipped: false,
     empty: 0,
@@ -141,6 +149,17 @@ export async function enrichNames(rows) {
   if (process.env.BUILD_ANIME365 === 'off') {
     console.log('Имена: волна anime365 выключена настройкой')
     stat.skipped = true
+    return { names, stat }
+  }
+
+  // Срок волны: меньшее из своего бюджета и общего срока прогона.
+  const until = Math.min(startedAll + NAMES_BUDGET_MS, Number(deadline) || Infinity)
+
+  // Времени может не остаться вовсе: волна идёт последней, а срок прогона
+  // общий. Тогда она честно не начинается, вместо того чтобы съесть выпуск.
+  if (until <= startedAll) {
+    stat.gaveUp = true
+    console.log('Имена: времени на волну не осталось, волна не начата')
     return { names, stat }
   }
 
@@ -167,7 +186,7 @@ export async function enrichNames(rows) {
 
   console.log(
     `Имена: без русского названия ${blank.length}, из них спрашивали недавно ${stat.known}, ` +
-      `спросим ${empty.length}, бюджет ${round1(BUDGET_MS / 60000)} мин`,
+      `спросим ${empty.length}, бюджет ${round1((until - startedAll) / 60000)} мин`,
   )
   if (empty.length === 0) return { names, stat }
 
@@ -176,7 +195,7 @@ export async function enrichNames(rows) {
   const stamp = today()
 
   for (const malId of empty) {
-    if (Date.now() - startedAll > BUDGET_MS) {
+    if (Date.now() > until) {
       stat.gaveUp = true
       console.log(
         `Имена: бюджет исчерпан, свёрнуто на ${stat.asked} из ${empty.length}`,
