@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Что лежит в свежем выпуске
+    url: https://github.com/foulnike/animori-data/releases/latest
+    about: Файлы, опись и описание последнего выпуска.
+  - name: Как это собирается
+    url: https://github.com/foulnike/animori-data/blob/main/README.md
+    about: 'Раздел «Как собирается» — шаги, пороги приёмки, расписание, цена прогона.'
+  - name: Вопросы про саму программу
+    url: https://github.com/foulnike/Animori-Desktop
+    about: Интерфейс, плеер и списки — не здесь, а в репозитории AniMori.

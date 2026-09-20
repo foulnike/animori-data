@@ -1,0 +1,50 @@
+name: Сборка не выходит
+description: Выпусков нет, прогон красный или файлы битые
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Сборка ходит по расписанию раз в неделю и сама себя сторожит: сторож в репозитории
+        программы заводит задачу, если выпуска нет десять дней. Если вы это видите раньше
+        него — тем лучше. Об упавшей сборке GitHub присылает письмо владельцу, поэтому
+        красный прогон почти всегда уже замечен; задача скорректирует приоритет.
+  - type: dropdown
+    id: what
+    attributes:
+      label: Что случилось
+      options:
+        - Выпусков давно нет
+        - Прогон красный
+        - Файл не скачивается
+        - Файл скачался, но не распаковывается
+        - Опись не сходится с файлами (отпечаток, размер)
+        - Выпуск есть, но опись пустая или чисел в ней нет
+        - Другое
+    validations:
+      required: true
+  - type: input
+    id: last
+    attributes:
+      label: Последний выпуск, который точно был
+      description: Тег из списка выпусков. Если не знаете, оставьте пустым.
+      placeholder: 2026.09.14-1012
+  - type: input
+    id: run
+    attributes:
+      label: Прогон
+      description: Ссылка на прогон в Actions, если он у вас открыт.
+      placeholder: https://github.com/foulnike/animori-data/actions/runs/…
+  - type: textarea
+    id: log
+    attributes:
+      label: Что в логе
+      description: Хвост лога шага или итог прогона целиком. Скриншот можно просто перетащить сюда.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Поиск по существующим issue ничего похожего не дал
+          required: true

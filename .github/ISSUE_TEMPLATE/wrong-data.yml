@@ -1,0 +1,67 @@
+name: Данные не те
+description: Ошибка в содержимом выпуска — имя, номер, дата
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Датасет собирает робот из Шикимори, anime365 и AniList, и вручную он не правится:
+        правка дожила бы ровно до следующей сборки и уехала. Здесь важно не «поправьте»,
+        а понять, откуда взялась ошибка — источник отдал не то или сборщик записал не так.
+        Чем точнее поля, тем быстрее это видно.
+  - type: input
+    id: title
+    attributes:
+      label: Тайтл
+      description: Название, как его показывает программа, и номер MyAnimeList, если известен.
+      placeholder: '5114 — Стальной алхимик: Братство'
+    validations:
+      required: true
+  - type: dropdown
+    id: what
+    attributes:
+      label: Что не так
+      options:
+        - Русское название не то или подставлено не к тому тайтлу
+        - Русского названия нет, хотя на источнике оно есть
+        - Номер MyAnimeList ведёт не на тот тайтл
+        - Связка MyAnimeList — AniList не та
+        - Дата выхода или оценка не те
+        - Тайтла нет в выпуске вовсе
+        - Другое
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Что на источнике
+      description: Сравните с Шикимори или AniList. Если источник отдаёт то же, что у нас, — править надо не сборщик.
+      options:
+        - На источнике иначе — ошибка наша
+        - На источнике то же — ошибка источника
+        - Не смотрел
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что должно быть
+      description: Правильное значение и адрес, где оно видно.
+      placeholder: |
+        Должно быть «Стальной алхимик: Братство».
+        Так на Шикимори: shikimori.one/animes/5114
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Выпуск
+      description: Тег выпуска из описи — поле `builtAt` в index.json. Если не смотрели, оставьте пустым.
+      placeholder: 2026.09.14-1012
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Поиск по существующим issue ничего похожего не дал
+          required: true

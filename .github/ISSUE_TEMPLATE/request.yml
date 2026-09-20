@@ -1,0 +1,45 @@
+name: Предложение
+description: Новый источник, поле в файле или правка в сборке
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Данные в выпуске — то, что отдают открытые API, и то, что программа умеет прочесть.
+        Прежде чем предлагать поле: лишний мегабайт в файле платят все установленные копии,
+        а читают его не все. Предложение выигрывает, если названо, кому и зачем это нужно.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Чего касается
+      options:
+        - Новый источник данных
+        - Новое поле в файле имён
+        - Новое поле в описи
+        - Карта соответствий
+        - Сборка и расписание
+        - Другое
+    validations:
+      required: true
+  - type: textarea
+    id: offer
+    attributes:
+      label: Что предлагаете и зачем
+      description: Кому это нужно и что сломается, если этого не будет.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Откуда брать
+      description: Для нового источника — адрес API, лицензия и условия. Датасет выходит под CC0-1.0, источник с несовместимыми условиями взять нельзя.
+      placeholder: |
+        Адрес: …
+        Лицензия и условия: …
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Поиск по существующим issue ничего похожего не дал
+          required: true
