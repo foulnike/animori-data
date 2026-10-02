@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/foulnike/animori-data/blob/main/README.md
     about: 'Раздел «Как собирается» — шаги, пороги приёмки, расписание, цена прогона.'
   - name: Вопросы про саму программу
-    url: https://github.com/foulnike/Animori-Desktop
+    url: https://github.com/foulnike/Animori
     about: Интерфейс, плеер и списки — не здесь, а в репозитории AniMori.
